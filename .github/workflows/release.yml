@@ -14,5 +14,4 @@ jobs:
       elf_binaries: microdns-linux-arm64
       elf_section: .microdns.version
       ci_workflow: ci.yml
-      ci_scripts_ref: v2
     secrets: inherit
