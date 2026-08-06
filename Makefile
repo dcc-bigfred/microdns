@@ -1,4 +1,4 @@
-# microdns — build / cross-compile / OCI helpers
+# microdns — build / cross-compile
 
 TARGET_MUSL ?= aarch64-unknown-linux-musl
 CARGO ?= cargo
@@ -6,17 +6,11 @@ RUSTUP_TOOLCHAIN ?= stable
 export RUSTUP_TOOLCHAIN
 
 CI_SCRIPTS_REPO ?= https://github.com/dcc-bigfred/.github.git
-CI_SCRIPTS_REF  ?= v1
+CI_SCRIPTS_REF  ?= v2
 CI_SCRIPTS_DIR  ?= .ci-github
 
-OCI_IMAGE  ?= ghcr.io/dcc-bigfred/microdns-linux-arm64
-OCI_TITLE  ?= microdns
-OCI_LAYERS ?= microdns-linux-arm64=application/vnd.dcc-bigfred.microdns.linux.arm64.v1
-OCI_ELF_LAYERS  ?= microdns-linux-arm64
-OCI_ELF_SECTION ?= .microdns.version
-
 .PHONY: all build release release-musl check test test-release-assertions \
-	clean fmt clippy ci-scripts-update publish-oci retag-oci
+	clean fmt clippy ci-scripts-update
 
 all: build
 
@@ -62,14 +56,3 @@ $(CI_SCRIPTS_DIR)/.ok:
 ci-scripts-update:
 	rm -rf "$(CI_SCRIPTS_DIR)"
 	$(MAKE) "$(CI_SCRIPTS_DIR)/.ok"
-
-publish-oci: release-musl $(CI_SCRIPTS_DIR)/.ok
-	cd dist && \
-	OCI_IMAGE="$(OCI_IMAGE)" OCI_TITLE="$(OCI_TITLE)" OCI_LAYERS="$(OCI_LAYERS)" \
-		"../$(CI_SCRIPTS_DIR)/scripts/publish-oci-linux.sh"
-
-retag-oci: $(CI_SCRIPTS_DIR)/.ok
-	@test -n "$(TAG)" || { echo "usage: make retag-oci TAG=v0.1.0"; exit 1; }
-	OCI_IMAGE="$(OCI_IMAGE)" OCI_TITLE="$(OCI_TITLE)" OCI_LAYERS="$(OCI_LAYERS)" \
-	OCI_ELF_LAYERS="$(OCI_ELF_LAYERS)" OCI_ELF_SECTION="$(OCI_ELF_SECTION)" \
-		"$(CI_SCRIPTS_DIR)/scripts/retag-oci-linux.sh" "$(TAG)"

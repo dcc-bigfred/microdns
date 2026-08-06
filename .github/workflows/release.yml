@@ -9,14 +9,10 @@ jobs:
   release:
     permissions:
       contents: write
-      packages: write
-    uses: dcc-bigfred/.github/.github/workflows/rust-oras-release.yml@v1
+    uses: dcc-bigfred/.github/.github/workflows/rust-release.yml@v2
     with:
-      oci_image: ghcr.io/dcc-bigfred/microdns-linux-arm64
-      oci_title: microdns
-      oci_layers: microdns-linux-arm64=application/vnd.dcc-bigfred.microdns.linux.arm64.v1
-      oci_elf_layers: microdns-linux-arm64
-      oci_elf_section: .microdns.version
+      elf_binaries: microdns-linux-arm64
+      elf_section: .microdns.version
       ci_workflow: ci.yml
-      ci_scripts_ref: v1
+      ci_scripts_ref: v2
     secrets: inherit

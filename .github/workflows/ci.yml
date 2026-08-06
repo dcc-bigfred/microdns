@@ -17,21 +17,8 @@ jobs:
   ci:
     permissions:
       contents: read
-    uses: dcc-bigfred/.github/.github/workflows/rust-musl-ci.yml@v1
+    uses: dcc-bigfred/.github/.github/workflows/rust-musl-ci.yml@v2
     with:
       binaries: '[{"name":"microdns","dist":"microdns-linux"}]'
       build_env: |
         MICRODNS_GIT_COMMIT=${{ github.sha }}
-
-  publish-oci:
-    needs: ci
-    permissions:
-      contents: read
-      packages: write
-    uses: dcc-bigfred/.github/.github/workflows/rust-oras-publish-main.yml@v1
-    with:
-      oci_image: ghcr.io/dcc-bigfred/microdns-linux-arm64
-      oci_title: microdns
-      oci_layers: microdns-linux-arm64=application/vnd.dcc-bigfred.microdns.linux.arm64.v1
-      ci_scripts_ref: v1
-    secrets: inherit
