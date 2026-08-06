@@ -9,7 +9,7 @@ jobs:
   release:
     permissions:
       contents: write
-    uses: dcc-bigfred/.github/.github/workflows/rust-release.yml@v2
+    uses: dcc-bigfred/common/.github/workflows/rust-release.yml@v2
     with:
       elf_binaries: microdns-linux-arm64
       elf_section: .microdns.version

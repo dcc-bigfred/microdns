@@ -5,12 +5,8 @@ CARGO ?= cargo
 RUSTUP_TOOLCHAIN ?= stable
 export RUSTUP_TOOLCHAIN
 
-CI_SCRIPTS_REPO ?= https://github.com/dcc-bigfred/.github.git
-CI_SCRIPTS_REF  ?= v2
-CI_SCRIPTS_DIR  ?= .ci-github
-
 .PHONY: all build release release-musl check test test-release-assertions \
-	clean fmt clippy ci-scripts-update
+	clean fmt clippy
 
 all: build
 
@@ -45,14 +41,3 @@ clippy:
 clean:
 	$(CARGO) clean
 	rm -rf dist
-
-$(CI_SCRIPTS_DIR)/.ok:
-	@echo "Cloning $(CI_SCRIPTS_REPO) @ $(CI_SCRIPTS_REF) → $(CI_SCRIPTS_DIR)"
-	@rm -rf "$(CI_SCRIPTS_DIR)"
-	@git clone --depth 1 --branch "$(CI_SCRIPTS_REF)" "$(CI_SCRIPTS_REPO)" "$(CI_SCRIPTS_DIR)" \
-		|| { echo "error: failed to clone $(CI_SCRIPTS_REPO) @ $(CI_SCRIPTS_REF)"; exit 1; }
-	@touch "$@"
-
-ci-scripts-update:
-	rm -rf "$(CI_SCRIPTS_DIR)"
-	$(MAKE) "$(CI_SCRIPTS_DIR)/.ok"

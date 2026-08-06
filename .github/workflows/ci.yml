@@ -17,7 +17,7 @@ jobs:
   ci:
     permissions:
       contents: read
-    uses: dcc-bigfred/.github/.github/workflows/rust-musl-ci.yml@v2
+    uses: dcc-bigfred/common/.github/workflows/rust-musl-ci.yml@v2
     with:
       binaries: '[{"name":"microdns","dist":"microdns-linux"}]'
       build_env: |
