@@ -5,12 +5,11 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write
-  packages: write
-
 jobs:
   release:
+    permissions:
+      contents: write
+      packages: write
     uses: dcc-bigfred/.github/.github/workflows/rust-oras-release.yml@v1
     with:
       oci_image: ghcr.io/dcc-bigfred/microdns-linux-arm64
