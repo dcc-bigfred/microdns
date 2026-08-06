@@ -9,15 +9,14 @@ on:
       - "v*"
   pull_request:
 
-permissions:
-  contents: read
-
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   ci:
+    permissions:
+      contents: read
     uses: dcc-bigfred/.github/.github/workflows/rust-musl-ci.yml@v1
     with:
       binaries: '[{"name":"microdns","dist":"microdns-linux"}]'
@@ -26,6 +25,9 @@ jobs:
 
   publish-oci:
     needs: ci
+    permissions:
+      contents: read
+      packages: write
     uses: dcc-bigfred/.github/.github/workflows/rust-oras-publish-main.yml@v1
     with:
       oci_image: ghcr.io/dcc-bigfred/microdns-linux-arm64
