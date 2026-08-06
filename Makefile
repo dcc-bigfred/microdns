@@ -5,7 +5,8 @@ CARGO ?= cargo
 RUSTUP_TOOLCHAIN ?= stable
 export RUSTUP_TOOLCHAIN
 
-.PHONY: all build release release-musl check test clean fmt clippy
+.PHONY: all build release release-musl check test test-release-assertions \
+	clean fmt clippy
 
 all: build
 
@@ -27,6 +28,9 @@ check:
 
 test:
 	$(CARGO) test
+
+test-release-assertions:
+	$(CARGO) test --profile release-assertions
 
 fmt:
 	$(CARGO) fmt

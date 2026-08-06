@@ -11,7 +11,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
 
-/// ELF section name (must match `scripts/inject-elf-version.sh`).
+/// ELF section name (must match org `.github` `inject-elf-version.sh` section arg).
 pub const SECTION_NAME: &str = ".microdns.version";
 
 /// Public version payload returned by `microdns info` / `--version`.

@@ -1,5 +1,6 @@
 /target/
 /dist/
+/.ci-github/
 **/*.rs.bk
 *.swp
 *.swo
