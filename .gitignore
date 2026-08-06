@@ -1,0 +1,10 @@
+/target/
+/dist/
+**/*.rs.bk
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.o
+*.a

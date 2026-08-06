@@ -1,0 +1,44 @@
+[package]
+name = "microdns"
+version = "0.1.0"
+edition = "2021"
+description = "Micro-daemon that advertises mDNS/DNS-SD services for BigFred OS"
+license = "MIT"
+authors = ["BigFred"]
+readme = "README.md"
+
+[lib]
+name = "microdns"
+path = "src/lib.rs"
+
+[[bin]]
+name = "microdns"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+mdns-sd = "0.13"
+nix = { version = "0.29", features = ["signal", "fs"] }
+thiserror = "2"
+libc = "0.2"
+notify = "8.2.0"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+overflow-checks = true
+
+[lints.rust]
+unused_must_use = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
