@@ -20,6 +20,15 @@ pub const DEFAULT_VIRTUAL_SERIAL: u32 = 258_000_000;
 
 const BEACON_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Stable Z21 virtual serial matching Go `z21server.VirtualSerial`:
+/// `258_000_000 + layoutId*1000 + commandStationId`.
+#[must_use]
+pub fn virtual_serial(layout_id: u32, command_station_id: u32) -> u32 {
+    DEFAULT_VIRTUAL_SERIAL
+        .saturating_add(layout_id.saturating_mul(1000))
+        .saturating_add(command_station_id)
+}
+
 /// Build a LAN_GET_SERIAL_NUMBER reply frame for `serial`.
 #[must_use]
 pub fn serial_reply(serial: u32) -> Vec<u8> {
@@ -115,5 +124,12 @@ mod tests {
             u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]),
             258_000_000
         );
+    }
+
+    #[test]
+    fn virtual_serial_matches_go() {
+        assert_eq!(virtual_serial(0, 0), 258_000_000);
+        assert_eq!(virtual_serial(2, 1), 258_002_001);
+        assert_eq!(virtual_serial(1, 2), 258_001_002);
     }
 }
