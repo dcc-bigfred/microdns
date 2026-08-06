@@ -66,6 +66,25 @@ pub fn is_dcc_bus_name(name: &str) -> bool {
     name == DCC_BUS_PREFIX || name.starts_with("dcc-bus-")
 }
 
+/// Parse `dcc-bus-<layoutId>-<commandStationId>` into `(layoutId, commandStationId)`.
+///
+/// Bare `dcc-bus` (no ids) returns `None`.
+#[must_use]
+pub fn parse_dcc_bus_ids(name: &str) -> Option<(u32, u32)> {
+    let rest = name.strip_prefix("dcc-bus-")?;
+    let (layout, cs) = rest.split_once('-')?;
+    if layout.is_empty() || cs.is_empty() || cs.contains('-') {
+        return None;
+    }
+    Some((layout.parse().ok()?, cs.parse().ok()?))
+}
+
+/// DNS-SD instance label matching Go `discovery.InstanceName("", csId)`.
+#[must_use]
+pub fn instance_name(command_station_id: u32) -> String {
+    format!("BigFred #{command_station_id}")
+}
+
 fn request(socket_path: &Path, req: &Request) -> Result<Response> {
     let mut stream = UnixStream::connect(socket_path)
         .map_err(|e| Error::Ipc(format!("cannot connect to {}: {e}", socket_path.display())))?;
@@ -139,6 +158,16 @@ mod tests {
         assert!(is_dcc_bus_name("dcc-bus-2-5"));
         assert!(!is_dcc_bus_name("bigfred"));
         assert!(!is_dcc_bus_name("dcc-busy"));
+    }
+
+    #[test]
+    fn parse_dcc_bus_ids_ok() {
+        assert_eq!(parse_dcc_bus_ids("dcc-bus-2-5"), Some((2, 5)));
+        assert_eq!(parse_dcc_bus_ids("dcc-bus-0-1"), Some((0, 1)));
+        assert_eq!(parse_dcc_bus_ids("dcc-bus"), None);
+        assert_eq!(parse_dcc_bus_ids("dcc-bus-2"), None);
+        assert_eq!(parse_dcc_bus_ids("dcc-bus-2-5-9"), None);
+        assert_eq!(parse_dcc_bus_ids("bigfred"), None);
     }
 
     #[test]

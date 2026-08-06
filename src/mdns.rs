@@ -280,15 +280,31 @@ fn ipv4_for_iface(name: &str) -> Vec<Ipv4Addr> {
 }
 
 /// Helper to register a dynamic dcc-bus service (`_z21._udp` / `_withrottle._tcp`).
-pub fn dcc_service_entry(instance: &str, type_: &str, protocol: &str, port: u16) -> ServiceEntry {
+///
+/// TXT mirrors the former in-process discovery sidecar: `layoutId`,
+/// `commandStationId`, `proto`, and for Z21 also `serial`.
+pub fn dcc_service_entry(
+    instance: &str,
+    type_: &str,
+    protocol: &str,
+    port: u16,
+    layout_id: u32,
+    command_station_id: u32,
+    serial: Option<u32>,
+) -> ServiceEntry {
     let mut txt = HashMap::new();
     txt.insert("proto".into(), protocol.into());
+    txt.insert("layoutId".into(), layout_id.to_string());
+    txt.insert("commandStationId".into(), command_station_id.to_string());
+    if let Some(serial) = serial {
+        txt.insert("serial".into(), serial.to_string());
+    }
     ServiceEntry {
         name: instance.into(),
         type_: type_.into(),
         protocol: protocol.into(),
         port,
-        host: Some(instance.into()),
+        host: None,
         txt: Some(txt),
     }
 }
@@ -341,7 +357,11 @@ mod tests {
 
     #[test]
     fn dcc_entry_has_proto_txt() {
-        let e = dcc_service_entry("hub1", "_z21._udp", "udp", 21105);
-        assert_eq!(e.txt.as_ref().unwrap().get("proto").unwrap(), "udp");
+        let e = dcc_service_entry("hub1", "_z21._udp", "udp", 21105, 2, 5, Some(258_002_005));
+        let txt = e.txt.as_ref().unwrap();
+        assert_eq!(txt.get("proto").unwrap(), "udp");
+        assert_eq!(txt.get("layoutId").unwrap(), "2");
+        assert_eq!(txt.get("commandStationId").unwrap(), "5");
+        assert_eq!(txt.get("serial").unwrap(), "258002005");
     }
 }

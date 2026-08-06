@@ -151,16 +151,19 @@ impl Default for Config {
 
 impl Config {
     pub fn validate(&self) -> Result<()> {
+        let mut names = std::collections::HashSet::new();
         for svc in &self.services {
             if svc.name.is_empty() {
                 return Err(Error::Config("service name must not be empty".into()));
             }
-            if svc.type_.is_empty() {
+            if !names.insert(svc.name.clone()) {
                 return Err(Error::Config(format!(
-                    "service '{}': type must not be empty",
+                    "duplicate service name '{}'",
                     svc.name
                 )));
             }
+            validate_service_type(&svc.name, &svc.type_)?;
+            validate_protocol(&svc.name, &svc.type_, &svc.protocol)?;
             if svc.port == 0 {
                 return Err(Error::Config(format!(
                     "service '{}': port must be non-zero",
@@ -168,8 +171,76 @@ impl Config {
                 )));
             }
         }
+        if self.dcc_bus.enabled {
+            if self.dcc_bus.z21_port == 0 {
+                return Err(Error::Config("dccBus.z21Port must be non-zero".into()));
+            }
+            if self.dcc_bus.withrottle_port == 0 {
+                return Err(Error::Config(
+                    "dccBus.withrottlePort must be non-zero".into(),
+                ));
+            }
+        }
         Ok(())
     }
+}
+
+/// Accept `_name._tcp` / `_name._udp`, optionally with a `.local` suffix.
+fn validate_service_type(name: &str, type_: &str) -> Result<()> {
+    if type_.is_empty() {
+        return Err(Error::Config(format!(
+            "service '{name}': type must not be empty"
+        )));
+    }
+    let base = type_
+        .trim()
+        .trim_end_matches('.')
+        .strip_suffix(".local")
+        .unwrap_or(type_.trim().trim_end_matches('.'));
+    let mut parts = base.split('.');
+    let (Some(svc), Some(trans), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(Error::Config(format!(
+            "service '{name}': type '{type_}' must look like _http._tcp or _z21._udp"
+        )));
+    };
+    if !svc.starts_with('_') || svc.len() < 2 {
+        return Err(Error::Config(format!(
+            "service '{name}': type '{type_}' service label must start with '_'"
+        )));
+    }
+    if trans != "_tcp" && trans != "_udp" {
+        return Err(Error::Config(format!(
+            "service '{name}': type '{type_}' transport must be _tcp or _udp"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_protocol(name: &str, type_: &str, protocol: &str) -> Result<()> {
+    let proto = protocol.trim().to_ascii_lowercase();
+    if proto != "tcp" && proto != "udp" {
+        return Err(Error::Config(format!(
+            "service '{name}': protocol must be tcp or udp"
+        )));
+    }
+    let base = type_
+        .trim()
+        .trim_end_matches('.')
+        .strip_suffix(".local")
+        .unwrap_or(type_.trim().trim_end_matches('.'));
+    let expected = if base.ends_with("._tcp") {
+        "tcp"
+    } else if base.ends_with("._udp") {
+        "udp"
+    } else {
+        return Ok(());
+    };
+    if proto != expected {
+        return Err(Error::Config(format!(
+            "service '{name}': protocol '{protocol}' does not match type '{type_}'"
+        )));
+    }
+    Ok(())
 }
 
 /// Load config from `path`, creating a default file if missing.
@@ -247,5 +318,22 @@ mod tests {
         }"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.services[0].type_, "_http._tcp");
+    }
+
+    #[test]
+    fn validate_rejects_bad_dns_sd_type() {
+        let mut cfg = Config::default();
+        cfg.services[0].type_ = "_http._sctp".into();
+        assert!(cfg.validate().is_err());
+        cfg.services[0].type_ = "_http._tcp".into();
+        cfg.services[0].protocol = "udp".into();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_names() {
+        let mut cfg = Config::default();
+        cfg.services.push(cfg.services[0].clone());
+        assert!(cfg.validate().is_err());
     }
 }

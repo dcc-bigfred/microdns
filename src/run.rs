@@ -1,18 +1,20 @@
 //! Main daemon loop: orchestrates config watch, mDNS, dcc-bus discovery, beacon.
 
+use std::collections::{HashMap, HashSet};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::beacon::{self, DEFAULT_VIRTUAL_SERIAL};
-use crate::config::{self, Config};
+use crate::beacon::{self, virtual_serial};
+use crate::config::{self, Config, ServiceEntry};
 use crate::config_watch::{self, ReloadSignal};
 use crate::error::Result;
 use crate::mdns::{self, MdnsPublisher};
 use crate::microinit_watch;
-use crate::proc_scan;
+use crate::proc_scan::{self, ListenPorts};
 use crate::signals;
 use crate::version;
 
@@ -60,13 +62,33 @@ impl FailThrottle {
     }
 }
 
+/// One dynamic DNS-SD registration derived from a running dcc-bus process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DynAd {
+    entry: ServiceEntry,
+}
+
+/// One Z21 LAN discovery beacon (port + virtual serial).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct BeaconWant {
+    port: u16,
+    serial: u32,
+}
+
 /// Desired advertisement set derived from config + empirical dcc-bus state.
+///
+/// `ips` is included so DHCP / interface address changes trigger re-registration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DesiredAds {
-    static_services: Vec<config::ServiceEntry>,
-    z21: Option<(String, u16)>,        // (instance, port)
-    withrottle: Option<(String, u16)>, // (instance, port)
-    beacon_port: Option<u16>,
+    static_services: Vec<ServiceEntry>,
+    dynamic: Vec<DynAd>,
+    beacons: Vec<BeaconWant>,
+    ips: Vec<Ipv4Addr>,
+}
+
+struct ActiveBeacon {
+    want: BeaconWant,
+    stop: Arc<AtomicBool>,
 }
 
 /// Run the daemon until shutdown signal.
@@ -91,8 +113,7 @@ pub fn run(config_path: &Path) -> Result<()> {
     let (reload_rx, watch_stop) = config_watch::spawn(config_path.to_path_buf())?;
 
     let publisher = Arc::new(Mutex::new(MdnsPublisher::new()));
-    let beacon_stop = Arc::new(AtomicBool::new(true)); // start stopped
-    let beacon_active = Arc::new(Mutex::new(false));
+    let beacons: Arc<Mutex<Vec<ActiveBeacon>>> = Arc::new(Mutex::new(Vec::new()));
 
     // Config reload thread → updates shared config.
     {
@@ -112,13 +133,11 @@ pub fn run(config_path: &Path) -> Result<()> {
 
     let mut last_desired = DesiredAds {
         static_services: Vec::new(),
-        z21: None,
-        withrottle: None,
-        beacon_port: None,
+        dynamic: Vec::new(),
+        beacons: Vec::new(),
+        ips: Vec::new(),
     };
-    let mut registered_keys: Vec<String> = Vec::new();
-
-    let hostname = version::hostname();
+    let mut registered: HashMap<String, ServiceEntry> = HashMap::new();
 
     while !signals::shutdown_requested() && !stop.load(Ordering::SeqCst) {
         let cfg = shared.config.read().map(|c| c.clone()).unwrap_or_default();
@@ -138,22 +157,21 @@ pub fn run(config_path: &Path) -> Result<()> {
             }
         }
 
-        // Interface check (non-fatal; addr_auto still works).
-        if mdns::has_usable_iface() {
-            iface_thr.ok("network interface");
-        } else {
+        let ips = mdns::preferred_ipv4_addrs();
+        if ips.is_empty() {
             iface_thr.fail(
                 "network interface",
                 &"no UP non-loopback IPv4 (skipping docker/veth/br-*)",
             );
+        } else {
+            iface_thr.ok("network interface");
         }
 
-        // Build desired ads from static services + optional dcc-bus.
         let mut desired = DesiredAds {
             static_services: cfg.services.clone(),
-            z21: None,
-            withrottle: None,
-            beacon_port: None,
+            dynamic: Vec::new(),
+            beacons: Vec::new(),
+            ips: ips.clone(),
         };
 
         if cfg.dcc_bus.enabled {
@@ -169,19 +187,19 @@ pub fn run(config_path: &Path) -> Result<()> {
                     } else {
                         microinit_thr.ok("microinit dcc-bus");
                         let mut any_scan_ok = false;
-                        let mut found_z21 = false;
-                        let mut found_withrottle = false;
                         for st in &running {
                             let pid = st.pid.unwrap();
                             match proc_scan::listen_ports_for_pid(pid) {
                                 Ok(ports) => {
                                     any_scan_ok = true;
-                                    if ports.has_udp(cfg.dcc_bus.z21_port) {
-                                        found_z21 = true;
-                                    }
-                                    if ports.has_tcp(cfg.dcc_bus.withrottle_port) {
-                                        found_withrottle = true;
-                                    }
+                                    append_station_ads(
+                                        &mut desired,
+                                        &st.name,
+                                        &ports,
+                                        cfg.dcc_bus.z21_port,
+                                        cfg.dcc_bus.withrottle_port,
+                                        cfg.dcc_bus.beacon,
+                                    );
                                 }
                                 Err(e) => proc_thr.fail("proc listen scan", &e),
                             }
@@ -189,16 +207,15 @@ pub fn run(config_path: &Path) -> Result<()> {
                         if any_scan_ok {
                             proc_thr.ok("proc listen scan");
                         }
-                        let instance = hostname.clone();
-                        if found_z21 {
-                            desired.z21 = Some((instance.clone(), cfg.dcc_bus.z21_port));
-                            if cfg.dcc_bus.beacon {
-                                desired.beacon_port = Some(cfg.dcc_bus.z21_port);
-                            }
-                        }
-                        if found_withrottle {
-                            desired.withrottle = Some((instance, cfg.dcc_bus.withrottle_port));
-                        }
+                        desired.dynamic.sort_by(|a, b| {
+                            (&a.entry.name, &a.entry.type_, a.entry.port).cmp(&(
+                                &b.entry.name,
+                                &b.entry.type_,
+                                b.entry.port,
+                            ))
+                        });
+                        desired.beacons.sort_unstable();
+                        desired.beacons.dedup();
                     }
                 }
                 Err(e) => {
@@ -207,15 +224,11 @@ pub fn run(config_path: &Path) -> Result<()> {
             }
         }
 
-        // Reconcile advertisements when desired set changes.
+        // Reconcile advertisements when desired set changes (incl. IP churn).
         if desired != last_desired {
-            if let Err(e) = reconcile(
-                &publisher,
-                &desired,
-                &mut registered_keys,
-                &beacon_stop,
-                &beacon_active,
-            ) {
+            let ips_changed = desired.ips != last_desired.ips;
+            if let Err(e) = reconcile(&publisher, &desired, &mut registered, &beacons, ips_changed)
+            {
                 mdns_thr.fail("mDNS register", &e);
             } else {
                 mdns_thr.ok("mDNS register");
@@ -235,11 +248,89 @@ pub fn run(config_path: &Path) -> Result<()> {
     log::info!("microdns shutting down");
     stop.store(true, Ordering::SeqCst);
     watch_stop.store(true, Ordering::SeqCst);
-    beacon_stop.store(true, Ordering::SeqCst);
+    if let Ok(mut active) = beacons.lock() {
+        for b in active.drain(..) {
+            b.stop.store(true, Ordering::SeqCst);
+        }
+    }
     if let Ok(mut p) = publisher.lock() {
         p.shutdown();
     }
     Ok(())
+}
+
+fn append_station_ads(
+    desired: &mut DesiredAds,
+    service_name: &str,
+    ports: &ListenPorts,
+    prefer_z21: u16,
+    prefer_wt: u16,
+    beacon: bool,
+) {
+    let (layout_id, command_station_id) = match microinit_watch::parse_dcc_bus_ids(service_name) {
+        Some(ids) => ids,
+        None => {
+            log::debug!("skipping dcc-bus service without layout/cs ids: {service_name}");
+            return;
+        }
+    };
+    let instance = microinit_watch::instance_name(command_station_id);
+    let serial = virtual_serial(layout_id, command_station_id);
+
+    if let Some(port) = pick_udp_port(ports, prefer_z21) {
+        desired.dynamic.push(DynAd {
+            entry: mdns::dcc_service_entry(
+                &instance,
+                "_z21._udp",
+                "udp",
+                port,
+                layout_id,
+                command_station_id,
+                Some(serial),
+            ),
+        });
+        if beacon {
+            desired.beacons.push(BeaconWant { port, serial });
+        }
+    }
+
+    if let Some(port) = pick_tcp_port(ports, prefer_wt) {
+        desired.dynamic.push(DynAd {
+            entry: mdns::dcc_service_entry(
+                &instance,
+                "_withrottle._tcp",
+                "tcp",
+                port,
+                layout_id,
+                command_station_id,
+                None,
+            ),
+        });
+    }
+}
+
+fn pick_udp_port(ports: &ListenPorts, prefer: u16) -> Option<u16> {
+    if ports.has_udp(prefer) {
+        return Some(prefer);
+    }
+    let mut udp: Vec<u16> = ports.udp.iter().copied().collect();
+    udp.sort_unstable();
+    udp.iter()
+        .copied()
+        .find(|p| (21_105..=22_000).contains(p))
+        .or_else(|| udp.first().copied())
+}
+
+fn pick_tcp_port(ports: &ListenPorts, prefer: u16) -> Option<u16> {
+    if ports.has_tcp(prefer) {
+        return Some(prefer);
+    }
+    let mut tcp: Vec<u16> = ports.tcp.iter().copied().collect();
+    tcp.sort_unstable();
+    tcp.iter()
+        .copied()
+        .find(|p| (12_090..=12_200).contains(p))
+        .or_else(|| tcp.first().copied())
 }
 
 fn reload_loop(
@@ -251,12 +342,13 @@ fn reload_loop(
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(ReloadSignal) => match config::load_or_create(&shared.config_path) {
                 Ok(cfg) => {
+                    // load_or_create already validates; keep last-known-good on failure.
                     if let Ok(mut w) = shared.config.write() {
                         *w = cfg;
                     }
                     log::info!("config reloaded from {}", shared.config_path.display());
                 }
-                Err(e) => log::warn!("config reload failed: {e}"),
+                Err(e) => log::warn!("config reload failed; keeping previous config: {e}"),
             },
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -264,61 +356,97 @@ fn reload_loop(
     }
 }
 
+/// Apply desired ads without withdrawing working records first.
+///
+/// 1. Register entries that are entirely new.
+/// 2. Refresh entries that changed (or when IPs changed): unregister then register.
+/// 3. Only then unregister keys that are no longer desired.
+/// 4. On register failure, return Err so the caller keeps `last_desired` and retries
+///    without committing a broken state.
 fn reconcile(
     publisher: &Arc<Mutex<MdnsPublisher>>,
     desired: &DesiredAds,
-    registered_keys: &mut Vec<String>,
-    beacon_stop: &Arc<AtomicBool>,
-    beacon_active: &Arc<Mutex<bool>>,
+    registered: &mut HashMap<String, ServiceEntry>,
+    beacons: &Arc<Mutex<Vec<ActiveBeacon>>>,
+    ips_changed: bool,
 ) -> Result<()> {
     let pub_guard = publisher.lock().unwrap();
 
-    // Unregister previous dynamic/static keys we track.
-    for key in registered_keys.drain(..) {
-        let _ = pub_guard.unregister(&key);
-    }
-
-    // Static services.
+    let mut desired_map: HashMap<String, ServiceEntry> = HashMap::new();
     for svc in &desired.static_services {
-        pub_guard.register(svc, None)?;
-        registered_keys.push(MdnsPublisher::fullname(&svc.name, &svc.type_));
+        let key = MdnsPublisher::fullname(&svc.name, &svc.type_);
+        desired_map.insert(key, svc.clone());
+    }
+    for dyn_ad in &desired.dynamic {
+        let key = MdnsPublisher::fullname(&dyn_ad.entry.name, &dyn_ad.entry.type_);
+        desired_map.insert(key, dyn_ad.entry.clone());
     }
 
-    // Dynamic dcc-bus services: instance name = hostname.
-    if let Some((instance, port)) = &desired.z21 {
-        let entry = mdns::dcc_service_entry(instance, "_z21._udp", "udp", *port);
-        pub_guard.register(&entry, Some(instance))?;
-        registered_keys.push(MdnsPublisher::fullname(instance, "_z21._udp"));
-    }
-    if let Some((instance, port)) = &desired.withrottle {
-        let entry = mdns::dcc_service_entry(instance, "_withrottle._tcp", "tcp", *port);
-        pub_guard.register(&entry, Some(instance))?;
-        registered_keys.push(MdnsPublisher::fullname(instance, "_withrottle._tcp"));
+    // Phase 1: add brand-new keys while old ads still answer queries.
+    for (key, entry) in &desired_map {
+        if registered.contains_key(key) {
+            continue;
+        }
+        pub_guard.register(entry, entry.host.as_deref())?;
+        registered.insert(key.clone(), entry.clone());
     }
 
-    // Beacon management.
-    let want_beacon = desired.beacon_port;
-    let mut active = beacon_active.lock().unwrap();
-    match (want_beacon, *active) {
-        (Some(port), false) => {
-            beacon_stop.store(false, Ordering::SeqCst);
-            let stop = Arc::clone(beacon_stop);
-            let frame = beacon::serial_reply(DEFAULT_VIRTUAL_SERIAL);
-            beacon::spawn(port, frame, stop)?;
-            *active = true;
+    // Phase 2: refresh changed content or rebound addresses after DHCP/iface churn.
+    for (key, entry) in &desired_map {
+        let Some(prev) = registered.get(key) else {
+            continue;
+        };
+        if prev == entry && !ips_changed {
+            continue;
         }
-        (None, true) => {
-            beacon_stop.store(true, Ordering::SeqCst);
-            *active = false;
-        }
-        (Some(port), true) => {
-            // Restart beacon if we need a different port: stop then start.
-            // For simplicity, if already active we leave it; port changes are rare.
-            let _ = port;
-        }
-        (None, false) => {}
+        let _ = pub_guard.unregister(key);
+        pub_guard.register(entry, entry.host.as_deref())?;
+        registered.insert(key.clone(), entry.clone());
     }
 
+    // Phase 3: drop obsolete keys only after desired set is registered.
+    let desired_keys: HashSet<String> = desired_map.keys().cloned().collect();
+    let stale: Vec<String> = registered
+        .keys()
+        .filter(|k| !desired_keys.contains(*k))
+        .cloned()
+        .collect();
+    for key in stale {
+        let _ = pub_guard.unregister(&key);
+        registered.remove(&key);
+    }
+
+    drop(pub_guard);
+    reconcile_beacons(beacons, &desired.beacons)?;
+    Ok(())
+}
+
+fn reconcile_beacons(beacons: &Arc<Mutex<Vec<ActiveBeacon>>>, want: &[BeaconWant]) -> Result<()> {
+    let want_set: HashSet<&BeaconWant> = want.iter().collect();
+    let mut active = beacons.lock().unwrap();
+
+    active.retain(|b| {
+        if want_set.contains(&b.want) {
+            true
+        } else {
+            b.stop.store(true, Ordering::SeqCst);
+            false
+        }
+    });
+
+    let active_set: HashSet<BeaconWant> = active.iter().map(|b| b.want.clone()).collect();
+    for w in want {
+        if active_set.contains(w) {
+            continue;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let frame = beacon::serial_reply(w.serial);
+        beacon::spawn(w.port, frame, Arc::clone(&stop))?;
+        active.push(ActiveBeacon {
+            want: w.clone(),
+            stop,
+        });
+    }
     Ok(())
 }
 
@@ -330,5 +458,60 @@ fn sleep_interruptible(total: Duration) {
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         thread::sleep(remaining.min(Duration::from_millis(200)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn pick_ports_prefer_configured() {
+        let mut ports = ListenPorts::default();
+        ports.udp.extend([21105, 21106]);
+        ports.tcp.extend([12090, 12091]);
+        assert_eq!(pick_udp_port(&ports, 21106), Some(21106));
+        assert_eq!(pick_tcp_port(&ports, 12091), Some(12091));
+    }
+
+    #[test]
+    fn pick_ports_fallback_range() {
+        let mut ports = ListenPorts::default();
+        ports.udp.insert(21150);
+        ports.tcp.insert(12095);
+        assert_eq!(pick_udp_port(&ports, 21105), Some(21150));
+        assert_eq!(pick_tcp_port(&ports, 12090), Some(12095));
+    }
+
+    #[test]
+    fn append_station_builds_identity() {
+        let mut desired = DesiredAds {
+            static_services: Vec::new(),
+            dynamic: Vec::new(),
+            beacons: Vec::new(),
+            ips: Vec::new(),
+        };
+        let mut ports = ListenPorts {
+            tcp: HashSet::new(),
+            udp: HashSet::new(),
+        };
+        ports.udp.insert(21106);
+        ports.tcp.insert(12091);
+        append_station_ads(&mut desired, "dcc-bus-2-5", &ports, 21105, 12090, true);
+        assert_eq!(desired.dynamic.len(), 2);
+        assert_eq!(desired.dynamic[0].entry.name, "BigFred #5");
+        assert_eq!(desired.dynamic[0].entry.port, 21106);
+        let txt = desired.dynamic[0].entry.txt.as_ref().unwrap();
+        assert_eq!(txt.get("layoutId").map(String::as_str), Some("2"));
+        assert_eq!(txt.get("commandStationId").map(String::as_str), Some("5"));
+        assert_eq!(txt.get("serial").map(String::as_str), Some("258002005"));
+        assert_eq!(
+            desired.beacons,
+            vec![BeaconWant {
+                port: 21106,
+                serial: 258_002_005
+            }]
+        );
     }
 }
