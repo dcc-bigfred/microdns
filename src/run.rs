@@ -197,8 +197,7 @@ pub fn run(config_path: &Path) -> Result<()> {
                             }
                         }
                         if found_withrottle {
-                            desired.withrottle =
-                                Some((instance, cfg.dcc_bus.withrottle_port));
+                            desired.withrottle = Some((instance, cfg.dcc_bus.withrottle_port));
                         }
                     }
                 }
