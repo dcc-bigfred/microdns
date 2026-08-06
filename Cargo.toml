@@ -35,6 +35,11 @@ strip = true
 panic = "abort"
 overflow-checks = true
 
+[profile.release-assertions]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
+
 [lints.rust]
 unused_must_use = "deny"
 
