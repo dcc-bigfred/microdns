@@ -63,7 +63,7 @@ fn socket_inodes(pid: i32) -> Result<HashSet<u64>> {
 }
 
 /// Parse `socket:[12345]` symlink target.
-fn parse_socket_link(path: &Path) -> Option<u64> {
+pub fn parse_socket_link(path: &Path) -> Option<u64> {
     let s = path.to_str()?;
     let rest = s.strip_prefix("socket:[")?;
     let num = rest.strip_suffix(']')?;
@@ -71,7 +71,7 @@ fn parse_socket_link(path: &Path) -> Option<u64> {
 }
 
 /// TCP LISTEN state in `/proc/net/tcp*` is hex `0A`.
-const TCP_LISTEN: &str = "0A";
+pub const TCP_LISTEN: &str = "0A";
 
 fn collect_tcp(path: &str, inodes: &HashSet<u64>, out: &mut HashSet<u16>) -> Result<()> {
     let data = match fs::read_to_string(path) {
@@ -110,7 +110,11 @@ fn collect_udp(path: &str, inodes: &HashSet<u64>, out: &mut HashSet<u16>) -> Res
 ///
 /// Columns (whitespace-separated): sl, local_address, rem_address, st, ...
 /// local_address is `IP:PORT` in hex. Inode is typically column index 9.
-fn parse_net_line(line: &str, inodes: &HashSet<u64>, require_state: Option<&str>) -> Option<u16> {
+pub fn parse_net_line(
+    line: &str,
+    inodes: &HashSet<u64>,
+    require_state: Option<&str>,
+) -> Option<u16> {
     let cols: Vec<&str> = line.split_whitespace().collect();
     if cols.len() < 10 {
         return None;
@@ -128,37 +132,4 @@ fn parse_net_line(line: &str, inodes: &HashSet<u64>, require_state: Option<&str>
     let port_hex = local.rsplit_once(':')?.1;
     let port = u16::from_str_radix(port_hex, 16).ok()?;
     Some(port)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    #[test]
-    fn parse_socket_link_ok() {
-        assert_eq!(
-            parse_socket_link(&PathBuf::from("socket:[12345]")),
-            Some(12345)
-        );
-        assert_eq!(parse_socket_link(&PathBuf::from("pipe:[1]")), None);
-    }
-
-    #[test]
-    fn parse_tcp_listen_line() {
-        let mut inodes = HashSet::new();
-        inodes.insert(12345);
-        // Typical /proc/net/tcp line (abbreviated columns padded).
-        let line = "   0: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  0        0 12345 1 0000000000000000 100 0 0 10 0";
-        assert_eq!(parse_net_line(line, &inodes, Some(TCP_LISTEN)), Some(8080));
-        assert_eq!(parse_net_line(line, &inodes, Some("01")), None);
-    }
-
-    #[test]
-    fn self_pid_scan_does_not_panic() {
-        let pid = std::process::id() as i32;
-        let ports = listen_ports_for_pid(pid).unwrap();
-        // May be empty; just ensure it succeeds.
-        let _ = ports;
-    }
 }

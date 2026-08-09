@@ -12,6 +12,7 @@ use crate::beacon::{self, virtual_serial};
 use crate::config::{self, Config, ServiceEntry};
 use crate::config_watch::{self, ReloadSignal};
 use crate::error::Result;
+use crate::legacy_unicast::{self, AnswerSet};
 use crate::mdns::{self, MdnsPublisher};
 use crate::microinit_watch;
 use crate::proc_scan::{self, ListenPorts};
@@ -64,26 +65,26 @@ impl FailThrottle {
 
 /// One dynamic DNS-SD registration derived from a running dcc-bus process.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DynAd {
-    entry: ServiceEntry,
+pub struct DynAd {
+    pub entry: ServiceEntry,
 }
 
 /// One Z21 LAN discovery beacon (port + virtual serial).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct BeaconWant {
-    port: u16,
-    serial: u32,
+pub struct BeaconWant {
+    pub port: u16,
+    pub serial: u32,
 }
 
 /// Desired advertisement set derived from config + empirical dcc-bus state.
 ///
 /// `ips` is included so DHCP / interface address changes trigger re-registration.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DesiredAds {
-    static_services: Vec<ServiceEntry>,
-    dynamic: Vec<DynAd>,
-    beacons: Vec<BeaconWant>,
-    ips: Vec<Ipv4Addr>,
+pub struct DesiredAds {
+    pub static_services: Vec<ServiceEntry>,
+    pub dynamic: Vec<DynAd>,
+    pub beacons: Vec<BeaconWant>,
+    pub ips: Vec<Ipv4Addr>,
 }
 
 struct ActiveBeacon {
@@ -114,6 +115,14 @@ pub fn run(config_path: &Path) -> Result<()> {
 
     let publisher = Arc::new(Mutex::new(MdnsPublisher::new()));
     let beacons: Arc<Mutex<Vec<ActiveBeacon>>> = Arc::new(Mutex::new(Vec::new()));
+    let answer_set = Arc::new(RwLock::new(AnswerSet::default()));
+    if let Err(e) = legacy_unicast::spawn(
+        Arc::clone(&answer_set),
+        legacy_unicast::MDNS_PORT,
+        Arc::clone(&stop),
+    ) {
+        log::warn!("legacy unicast responder failed to start: {e}");
+    }
 
     // Config reload thread → updates shared config.
     {
@@ -165,6 +174,27 @@ pub fn run(config_path: &Path) -> Result<()> {
             );
         } else {
             iface_thr.ok("network interface");
+        }
+
+        {
+            let mut hosts = Vec::new();
+            for svc in &cfg.services {
+                let host =
+                    mdns::normalize_hostname(svc.host.as_deref().unwrap_or(&version::hostname()));
+                if !hosts.iter().any(|h| h == &host) {
+                    hosts.push(host);
+                }
+            }
+            let next = AnswerSet {
+                hosts,
+                v4: mdns::preferred_ipv4_ifaces(),
+                v6: mdns::preferred_ipv6_addrs(),
+            };
+            if let Ok(mut w) = answer_set.write() {
+                if *w != next {
+                    *w = next;
+                }
+            }
         }
 
         let mut desired = DesiredAds {
@@ -259,7 +289,7 @@ pub fn run(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn append_station_ads(
+pub fn append_station_ads(
     desired: &mut DesiredAds,
     service_name: &str,
     ports: &ListenPorts,
@@ -309,7 +339,7 @@ fn append_station_ads(
     }
 }
 
-fn pick_udp_port(ports: &ListenPorts, prefer: u16) -> Option<u16> {
+pub fn pick_udp_port(ports: &ListenPorts, prefer: u16) -> Option<u16> {
     if ports.has_udp(prefer) {
         return Some(prefer);
     }
@@ -321,7 +351,7 @@ fn pick_udp_port(ports: &ListenPorts, prefer: u16) -> Option<u16> {
         .or_else(|| udp.first().copied())
 }
 
-fn pick_tcp_port(ports: &ListenPorts, prefer: u16) -> Option<u16> {
+pub fn pick_tcp_port(ports: &ListenPorts, prefer: u16) -> Option<u16> {
     if ports.has_tcp(prefer) {
         return Some(prefer);
     }
@@ -458,60 +488,5 @@ fn sleep_interruptible(total: Duration) {
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         thread::sleep(remaining.min(Duration::from_millis(200)));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashSet;
-
-    #[test]
-    fn pick_ports_prefer_configured() {
-        let mut ports = ListenPorts::default();
-        ports.udp.extend([21105, 21106]);
-        ports.tcp.extend([12090, 12091]);
-        assert_eq!(pick_udp_port(&ports, 21106), Some(21106));
-        assert_eq!(pick_tcp_port(&ports, 12091), Some(12091));
-    }
-
-    #[test]
-    fn pick_ports_fallback_range() {
-        let mut ports = ListenPorts::default();
-        ports.udp.insert(21150);
-        ports.tcp.insert(12095);
-        assert_eq!(pick_udp_port(&ports, 21105), Some(21150));
-        assert_eq!(pick_tcp_port(&ports, 12090), Some(12095));
-    }
-
-    #[test]
-    fn append_station_builds_identity() {
-        let mut desired = DesiredAds {
-            static_services: Vec::new(),
-            dynamic: Vec::new(),
-            beacons: Vec::new(),
-            ips: Vec::new(),
-        };
-        let mut ports = ListenPorts {
-            tcp: HashSet::new(),
-            udp: HashSet::new(),
-        };
-        ports.udp.insert(21106);
-        ports.tcp.insert(12091);
-        append_station_ads(&mut desired, "dcc-bus-2-5", &ports, 21105, 12090, true);
-        assert_eq!(desired.dynamic.len(), 2);
-        assert_eq!(desired.dynamic[0].entry.name, "BigFred #5");
-        assert_eq!(desired.dynamic[0].entry.port, 21106);
-        let txt = desired.dynamic[0].entry.txt.as_ref().unwrap();
-        assert_eq!(txt.get("layoutId").map(String::as_str), Some("2"));
-        assert_eq!(txt.get("commandStationId").map(String::as_str), Some("5"));
-        assert_eq!(txt.get("serial").map(String::as_str), Some("258002005"));
-        assert_eq!(
-            desired.beacons,
-            vec![BeaconWant {
-                port: 21106,
-                serial: 258_002_005
-            }]
-        );
     }
 }

@@ -9,14 +9,23 @@ unavailable. Always starts successfully.
 
 - Static DNS-SD services from `$DATA_DIR/etc/microdns.json` (default `/data`)
 - Hostname A records for configured `host` values (e.g. `bigfred` → `bigfred.local`)
-- Legacy unicast / one-shot mDNS replies (RFC 6762 §6.7) so browsers and OS
-  resolvers can resolve `.local` names — not only DNS-SD service browsers
+- Own legacy unicast / one-shot mDNS responder (RFC 6762 §6.7) so browsers and OS
+  resolvers (Android `getaddrinfo`) can resolve `.local` names — not only DNS-SD
+  browsers. Needed because **mdns-sd 0.20.3** answers unicast but hardcodes
+  transaction ID=`0` (`dns_parser.rs`: `let id = if self.multicast { 0 } else { self.id }`
+  while `DnsOutgoing.multicast` is never set false). Remove `legacy_unicast` when
+  upstream fixes that encoding.
 - Optional dcc-bus discovery: when enabled, watches microinit for a running
   `dcc-bus` process and advertises `_z21._udp` / `_withrottle._tcp` only when
   those ports are empirically listening
 - Optional Z21 UDP LAN discovery beacon (LAN_GET_SERIAL_NUMBER reply broadcast)
 - Hot-reload via inotify on the config file
 - Static musl builds for linux/arm64 and linux/amd64
+
+## Tests
+
+Integration-style unit tests live under `tests/` (one file per module), matching
+the microinit layout. Run with `cargo test` / `make test`.
 
 ## Config
 

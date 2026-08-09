@@ -220,20 +220,3 @@ pub fn format_info(info: &Info) -> String {
     lines.push(format!("hostname: {}", hostname()));
     lines.join("\n")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn info_has_build_commit() {
-        let i = info();
-        assert!(!i.build_commit.is_empty());
-        assert_eq!(i.version, "dev"); // no injected section in test binary
-    }
-
-    #[test]
-    fn non_elf_returns_none() {
-        assert!(read_section_from(Path::new("/etc/hosts")).is_none());
-    }
-}

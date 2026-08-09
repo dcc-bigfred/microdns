@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
 
 use mdns_sd::{ServiceDaemon, ServiceInfo};
@@ -173,6 +173,15 @@ pub fn normalize_hostname(host: &str) -> String {
 /// Collect preferred IPv4 addresses: UP, non-loopback, not docker/veth/br-*.
 #[must_use]
 pub fn preferred_ipv4_addrs() -> Vec<Ipv4Addr> {
+    preferred_ipv4_ifaces()
+        .into_iter()
+        .map(|(ip, _mask)| ip)
+        .collect()
+}
+
+/// Preferred IPv4 addresses with netmasks (for same-subnet reply selection).
+#[must_use]
+pub fn preferred_ipv4_ifaces() -> Vec<(Ipv4Addr, Ipv4Addr)> {
     let mut addrs = Vec::new();
     let Ok(ifaces) = list_interfaces() else {
         return addrs;
@@ -184,13 +193,66 @@ pub fn preferred_ipv4_addrs() -> Vec<Ipv4Addr> {
         if !iface.is_up || iface.is_loopback {
             continue;
         }
-        for ip in iface.ipv4 {
+        for (ip, mask) in iface.ipv4 {
             if !ip.is_loopback() && !ip.is_unspecified() {
-                addrs.push(ip);
+                addrs.push((ip, mask));
             }
         }
     }
     addrs
+}
+
+/// Preferred global/ULA IPv6 addresses (no loopback, unspecified, or link-local).
+#[must_use]
+pub fn preferred_ipv6_addrs() -> Vec<Ipv6Addr> {
+    let mut addrs = Vec::new();
+    let Ok(ifaces) = list_interfaces() else {
+        return addrs;
+    };
+    for iface in ifaces {
+        if should_skip_iface(&iface.name) {
+            continue;
+        }
+        if !iface.is_up || iface.is_loopback {
+            continue;
+        }
+        for ip in iface.ipv6 {
+            if ip.is_loopback() || ip.is_unspecified() || is_ipv6_link_local(&ip) {
+                continue;
+            }
+            addrs.push(ip);
+        }
+    }
+    addrs
+}
+
+/// Interface index for multicast group joins (IPv6).
+#[must_use]
+pub fn preferred_iface_indexes() -> Vec<u32> {
+    let mut out = Vec::new();
+    let Ok(ifaces) = list_interfaces() else {
+        return out;
+    };
+    for iface in ifaces {
+        if should_skip_iface(&iface.name) {
+            continue;
+        }
+        if !iface.is_up || iface.is_loopback {
+            continue;
+        }
+        if iface.ipv4.is_empty() && iface.ipv6.is_empty() {
+            continue;
+        }
+        if iface.ifindex != 0 {
+            out.push(iface.ifindex);
+        }
+    }
+    out
+}
+
+fn is_ipv6_link_local(ip: &Ipv6Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80
 }
 
 /// Whether to skip an interface by name (docker/veth/bridge).
@@ -212,7 +274,9 @@ struct IfaceInfo {
     name: String,
     is_up: bool,
     is_loopback: bool,
-    ipv4: Vec<Ipv4Addr>,
+    ifindex: u32,
+    ipv4: Vec<(Ipv4Addr, Ipv4Addr)>,
+    ipv6: Vec<Ipv6Addr>,
 }
 
 fn list_interfaces() -> Result<Vec<IfaceInfo>> {
@@ -233,25 +297,30 @@ fn list_interfaces() -> Result<Vec<IfaceInfo>> {
         // IFF_UP=0x1, IFF_LOOPBACK=0x8
         let is_up = (flags_val & 0x1) != 0 || operstate == "up";
         let is_loopback = (flags_val & 0x8) != 0 || name == "lo";
-        let ipv4 = ipv4_for_iface(&name);
+        let ifindex = fs::read_to_string(entry.path().join("ifindex"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        let (ipv4, ipv6) = addrs_for_iface(&name);
         out.push(IfaceInfo {
             name,
             is_up,
             is_loopback,
+            ifindex,
             ipv4,
+            ipv6,
         });
     }
     Ok(out)
 }
 
-fn ipv4_for_iface(name: &str) -> Vec<Ipv4Addr> {
-    let mut ips = Vec::new();
-    // Parse `ip -o -4 addr show` is unavailable as a dep; use /proc/net/fib_trie
-    // is complex. Instead read from `getifaddrs` via libc.
+fn addrs_for_iface(name: &str) -> (Vec<(Ipv4Addr, Ipv4Addr)>, Vec<Ipv6Addr>) {
+    let mut ipv4 = Vec::new();
+    let mut ipv6 = Vec::new();
     unsafe {
         let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
         if libc::getifaddrs(&mut ifap) != 0 {
-            return ips;
+            return (ipv4, ipv6);
         }
         let mut cur = ifap;
         while !cur.is_null() {
@@ -268,7 +337,17 @@ fn ipv4_for_iface(name: &str) -> Vec<Ipv4Addr> {
                     if addr.sa_family as i32 == libc::AF_INET {
                         let sin = &*(iface.ifa_addr as *const libc::sockaddr_in);
                         let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-                        ips.push(ip);
+                        let mask = if iface.ifa_netmask.is_null() {
+                            Ipv4Addr::new(255, 255, 255, 0)
+                        } else {
+                            let smask = &*(iface.ifa_netmask as *const libc::sockaddr_in);
+                            Ipv4Addr::from(u32::from_be(smask.sin_addr.s_addr))
+                        };
+                        ipv4.push((ip, mask));
+                    } else if addr.sa_family as i32 == libc::AF_INET6 {
+                        let sin6 = &*(iface.ifa_addr as *const libc::sockaddr_in6);
+                        let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+                        ipv6.push(ip);
                     }
                 }
             }
@@ -276,7 +355,7 @@ fn ipv4_for_iface(name: &str) -> Vec<Ipv4Addr> {
         }
         libc::freeifaddrs(ifap);
     }
-    ips
+    (ipv4, ipv6)
 }
 
 /// Helper to register a dynamic dcc-bus service (`_z21._udp` / `_withrottle._tcp`).
@@ -319,49 +398,4 @@ pub fn has_usable_iface() -> bool {
 #[must_use]
 pub fn primary_ip() -> Option<IpAddr> {
     preferred_ipv4_addrs().into_iter().next().map(IpAddr::V4)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalize_type() {
-        assert_eq!(normalize_service_type("_http._tcp"), "_http._tcp.local.");
-        assert_eq!(
-            normalize_service_type("_http._tcp.local"),
-            "_http._tcp.local."
-        );
-        assert_eq!(
-            normalize_service_type("_http._tcp.local."),
-            "_http._tcp.local."
-        );
-    }
-
-    #[test]
-    fn normalize_host() {
-        assert_eq!(normalize_hostname("bigfred"), "bigfred.local.");
-        assert_eq!(normalize_hostname("bigfred.local"), "bigfred.local.");
-        assert_eq!(normalize_hostname("bigfred.local."), "bigfred.local.");
-    }
-
-    #[test]
-    fn skip_virtual_ifaces() {
-        assert!(should_skip_iface("veth0abc"));
-        assert!(should_skip_iface("br-1234abcd"));
-        assert!(should_skip_iface("docker0"));
-        assert!(!should_skip_iface("eth0"));
-        assert!(!should_skip_iface("wlan0"));
-        assert!(!should_skip_iface("enp1s0"));
-    }
-
-    #[test]
-    fn dcc_entry_has_proto_txt() {
-        let e = dcc_service_entry("hub1", "_z21._udp", "udp", 21105, 2, 5, Some(258_002_005));
-        let txt = e.txt.as_ref().unwrap();
-        assert_eq!(txt.get("proto").unwrap(), "udp");
-        assert_eq!(txt.get("layoutId").unwrap(), "2");
-        assert_eq!(txt.get("commandStationId").unwrap(), "5");
-        assert_eq!(txt.get("serial").unwrap(), "258002005");
-    }
 }
