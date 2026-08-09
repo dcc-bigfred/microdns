@@ -203,56 +203,66 @@ fn build_any_includes_a_and_aaaa() {
 
 #[test]
 fn spawn_echoes_transaction_id_on_ephemeral_port() {
-    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind probe");
-    let port = sock.local_addr().unwrap().port();
-    // Free the port so the responder can bind it; we re-bind as client after spawn.
-    drop(sock);
-
-    let answers = Arc::new(RwLock::new(AnswerSet {
-        hosts: vec!["bigfred.local.".into()],
-        v4: vec![(Ipv4Addr::new(127, 0, 0, 1), Ipv4Addr::new(255, 0, 0, 0))],
-        v6: Vec::new(),
-    }));
-    let stop = Arc::new(AtomicBool::new(false));
-    spawn(Arc::clone(&answers), port, Arc::clone(&stop)).expect("spawn");
-
-    // Wait until responder is listening.
-    let client = {
-        let mut last_err = None;
-        let mut bound = None;
-        for _ in 0..50 {
-            match UdpSocket::bind("127.0.0.1:0") {
-                Ok(c) => {
-                    c.set_read_timeout(Some(Duration::from_millis(500)))
-                        .unwrap();
-                    // Probe by sending; retry until we get a reply or timeout budget.
-                    bound = Some(c);
-                    break;
-                }
-                Err(e) => last_err = Some(e),
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        bound.unwrap_or_else(|| panic!("client bind: {last_err:?}"))
-    };
-
+    // To avoid racing another process for an ephemeral port, we retry the
+    // whole bind-spawn-query cycle a few times. Each attempt:
+    //   1. Probe-binds 127.0.0.1:0 to discover a free port P.
+    //   2. Drops the probe and immediately spawns the responder on P.
+    //      (SO_REUSEPORT lets the responder bind even if a stray process
+    //      grabbed P in the tiny window.)
+    //   3. Client binds a *different* ephemeral port Q and queries P.
+    // If we never get a reply, we discard this attempt and try a new port.
     let query_id = 0xabcd;
     let pkt = build_query(query_id, "bigfred.local.", QTYPE_A, 1);
-    let mut got = None;
-    for _ in 0..40 {
-        let _ = client.send_to(&pkt, ("127.0.0.1", port));
-        let mut buf = [0u8; 512];
-        match client.recv_from(&mut buf) {
-            Ok((n, _)) => {
-                got = Some(buf[..n].to_vec());
-                break;
-            }
-            Err(_) => thread::sleep(Duration::from_millis(50)),
-        }
-    }
-    stop.store(true, Ordering::SeqCst);
 
-    let resp = got.expect("timed out waiting for legacy unicast reply");
+    let mut got = None;
+    for attempt in 0..5 {
+        let probe = match UdpSocket::bind("127.0.0.1:0") {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let answers = Arc::new(RwLock::new(AnswerSet {
+            hosts: vec!["bigfred.local.".into()],
+            v4: vec![(Ipv4Addr::new(127, 0, 0, 1), Ipv4Addr::new(255, 0, 0, 0))],
+            v6: Vec::new(),
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        if spawn(Arc::clone(&answers), port, Arc::clone(&stop)).is_err() {
+            continue;
+        }
+
+        let client = match UdpSocket::bind("127.0.0.1:0") {
+            Ok(c) => c,
+            Err(_) => {
+                stop.store(true, Ordering::SeqCst);
+                continue;
+            }
+        };
+        client
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+
+        for _ in 0..20 {
+            let _ = client.send_to(&pkt, ("127.0.0.1", port));
+            let mut buf = [0u8; 512];
+            match client.recv_from(&mut buf) {
+                Ok((n, _)) => {
+                    got = Some(buf[..n].to_vec());
+                    break;
+                }
+                Err(_) => thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        if got.is_some() {
+            break;
+        }
+        eprintln!("spawn_echoes_transaction_id: attempt {} got no reply, retrying", attempt);
+    }
+
+    let resp = got.expect("timed out waiting for legacy unicast reply after 5 attempts");
     assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), query_id);
     // TTL check on first answer
     let mut pos = 12usize;

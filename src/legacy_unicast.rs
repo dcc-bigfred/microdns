@@ -76,6 +76,10 @@ fn run_loop(state: Arc<RwLock<AnswerSet>>, port: u16, stop: Arc<AtomicBool>) -> 
     let mut sock_v6: Option<UdpSocket> = None;
     let mut joined_v4: Vec<Ipv4Addr> = Vec::new();
     let mut joined_ifindexes: Vec<u32> = Vec::new();
+    // Cache of the AnswerSet snapshot last used to compute multicast joins.
+    // refresh_memberships is expensive (getifaddrs + /sys read) so we only
+    // recompute when the AnswerSet actually changes.
+    let mut last_answer_snapshot: Option<AnswerSet> = None;
 
     while !stop.load(Ordering::SeqCst) {
         if sock_v4.is_none() {
@@ -111,13 +115,18 @@ fn run_loop(state: Arc<RwLock<AnswerSet>>, port: u16, stop: Arc<AtomicBool>) -> 
         }
 
         if !test_mode {
-            refresh_memberships(
-                sock_v4.as_ref(),
-                sock_v6.as_ref(),
-                &state,
-                &mut joined_v4,
-                &mut joined_ifindexes,
-            );
+            let current_snapshot = state.read().map(|g| g.clone()).ok();
+            let changed = current_snapshot.as_ref() != last_answer_snapshot.as_ref();
+            if changed {
+                refresh_memberships(
+                    sock_v4.as_ref(),
+                    sock_v6.as_ref(),
+                    &state,
+                    &mut joined_v4,
+                    &mut joined_ifindexes,
+                );
+                last_answer_snapshot = current_snapshot;
+            }
         }
 
         let mut buf = [0u8; 2048];
@@ -134,6 +143,7 @@ fn run_loop(state: Arc<RwLock<AnswerSet>>, port: u16, stop: Arc<AtomicBool>) -> 
                     log::debug!("legacy unicast v4 recv: {e}");
                     sock_v4 = None;
                     joined_v4.clear();
+                    last_answer_snapshot = None;
                 }
             }
         }
@@ -148,11 +158,12 @@ fn run_loop(state: Arc<RwLock<AnswerSet>>, port: u16, stop: Arc<AtomicBool>) -> 
                     log::debug!("legacy unicast v6 recv: {e}");
                     sock_v6 = None;
                     joined_ifindexes.clear();
+                    last_answer_snapshot = None;
                 }
             }
         }
 
-        if !got_any && sock_v4.is_none() && sock_v6.is_none() {
+        if !got_any {
             thread::sleep(Duration::from_millis(50));
         }
     }
