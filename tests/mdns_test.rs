@@ -28,7 +28,8 @@ fn skip_virtual_ifaces() {
     assert!(should_skip_iface("br-1234abcd"));
     assert!(should_skip_iface("docker0"));
     assert!(!should_skip_iface("eth0"));
-    assert!(!should_skip_iface("wlan0"));
+    assert!(should_skip_iface("wlan0"));
+    assert!(should_skip_iface("WLAN0"));
     assert!(!should_skip_iface("enp1s0"));
 }
 

@@ -255,7 +255,14 @@ fn is_ipv6_link_local(ip: &Ipv6Addr) -> bool {
     octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80
 }
 
-/// Whether to skip an interface by name (docker/veth/bridge).
+/// Whether to skip an interface by name (docker/veth/bridge/wlan).
+///
+/// `wlan*` is skipped because, on the BigFred hub, the on-board WiFi radio is
+/// an exclusive, on-demand resource used only by `wireless-programmer` to
+/// associate to a device config AP (e.g. a NewHeiko WiFred) for the duration
+/// of a programming job. It never carries hub services, so advertising mDNS
+/// on it would leak `bigfred.local` / dcc-bus beacons onto a customer's
+/// device config network.
 #[must_use]
 pub fn should_skip_iface(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
@@ -267,6 +274,7 @@ pub fn should_skip_iface(name: &str) -> bool {
         || n == "cni0"
         || n.starts_with("flannel")
         || n.starts_with("virbr")
+        || n.starts_with("wlan")
 }
 
 #[derive(Debug)]
