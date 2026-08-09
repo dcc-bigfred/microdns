@@ -8,6 +8,9 @@ unavailable. Always starts successfully.
 ## Features
 
 - Static DNS-SD services from `$DATA_DIR/etc/microdns.json` (default `/data`)
+- Hostname A records for configured `host` values (e.g. `bigfred` → `bigfred.local`)
+- Legacy unicast / one-shot mDNS replies (RFC 6762 §6.7) so browsers and OS
+  resolvers can resolve `.local` names — not only DNS-SD service browsers
 - Optional dcc-bus discovery: when enabled, watches microinit for a running
   `dcc-bus` process and advertises `_z21._udp` / `_withrottle._tcp` only when
   those ports are empirically listening
