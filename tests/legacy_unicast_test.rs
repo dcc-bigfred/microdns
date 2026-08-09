@@ -259,7 +259,10 @@ fn spawn_echoes_transaction_id_on_ephemeral_port() {
         if got.is_some() {
             break;
         }
-        eprintln!("spawn_echoes_transaction_id: attempt {} got no reply, retrying", attempt);
+        eprintln!(
+            "spawn_echoes_transaction_id: attempt {} got no reply, retrying",
+            attempt
+        );
     }
 
     let resp = got.expect("timed out waiting for legacy unicast reply after 5 attempts");
