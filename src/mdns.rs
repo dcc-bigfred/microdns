@@ -47,7 +47,12 @@ impl MdnsPublisher {
     }
 
     /// Register (or re-register) a service. Uses auto addresses when available.
-    pub fn register(&self, entry: &ServiceEntry, host_override: Option<&str>) -> Result<()> {
+    pub fn register(
+        &self,
+        entry: &ServiceEntry,
+        host_override: Option<&str>,
+        skip: &[String],
+    ) -> Result<()> {
         let daemon = self
             .daemon
             .as_ref()
@@ -60,7 +65,7 @@ impl MdnsPublisher {
                 .unwrap_or(&version::hostname()),
         );
         let props = entry.txt.clone().unwrap_or_default();
-        let ips = preferred_ipv4_addrs();
+        let ips = preferred_ipv4_addrs(skip);
 
         let info = if ips.is_empty() {
             // No usable interface yet — register with addr_auto so mdns-sd
@@ -172,8 +177,8 @@ pub fn normalize_hostname(host: &str) -> String {
 
 /// Collect preferred IPv4 addresses: UP, non-loopback, not docker/veth/br-*.
 #[must_use]
-pub fn preferred_ipv4_addrs() -> Vec<Ipv4Addr> {
-    preferred_ipv4_ifaces()
+pub fn preferred_ipv4_addrs(skip: &[String]) -> Vec<Ipv4Addr> {
+    preferred_ipv4_ifaces(skip)
         .into_iter()
         .map(|(ip, _mask)| ip)
         .collect()
@@ -181,13 +186,13 @@ pub fn preferred_ipv4_addrs() -> Vec<Ipv4Addr> {
 
 /// Preferred IPv4 addresses with netmasks (for same-subnet reply selection).
 #[must_use]
-pub fn preferred_ipv4_ifaces() -> Vec<(Ipv4Addr, Ipv4Addr)> {
+pub fn preferred_ipv4_ifaces(skip: &[String]) -> Vec<(Ipv4Addr, Ipv4Addr)> {
     let mut addrs = Vec::new();
     let Ok(ifaces) = list_interfaces() else {
         return addrs;
     };
     for iface in ifaces {
-        if should_skip_iface(&iface.name) {
+        if should_skip_iface(&iface.name, skip) {
             continue;
         }
         if !iface.is_up || iface.is_loopback {
@@ -204,13 +209,13 @@ pub fn preferred_ipv4_ifaces() -> Vec<(Ipv4Addr, Ipv4Addr)> {
 
 /// Preferred global/ULA IPv6 addresses (no loopback, unspecified, or link-local).
 #[must_use]
-pub fn preferred_ipv6_addrs() -> Vec<Ipv6Addr> {
+pub fn preferred_ipv6_addrs(skip: &[String]) -> Vec<Ipv6Addr> {
     let mut addrs = Vec::new();
     let Ok(ifaces) = list_interfaces() else {
         return addrs;
     };
     for iface in ifaces {
-        if should_skip_iface(&iface.name) {
+        if should_skip_iface(&iface.name, skip) {
             continue;
         }
         if !iface.is_up || iface.is_loopback {
@@ -228,13 +233,13 @@ pub fn preferred_ipv6_addrs() -> Vec<Ipv6Addr> {
 
 /// Interface index for multicast group joins (IPv6).
 #[must_use]
-pub fn preferred_iface_indexes() -> Vec<u32> {
+pub fn preferred_iface_indexes(skip: &[String]) -> Vec<u32> {
     let mut out = Vec::new();
     let Ok(ifaces) = list_interfaces() else {
         return out;
     };
     for iface in ifaces {
-        if should_skip_iface(&iface.name) {
+        if should_skip_iface(&iface.name, skip) {
             continue;
         }
         if !iface.is_up || iface.is_loopback {
@@ -255,18 +260,18 @@ fn is_ipv6_link_local(ip: &Ipv6Addr) -> bool {
     octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80
 }
 
-/// Whether to skip an interface by name (docker/veth/bridge/wlan).
+/// Whether to skip an interface by name.
 ///
-/// `wlan*` is skipped because, on the BigFred hub, the on-board WiFi radio is
-/// an exclusive, on-demand resource used only by `wireless-programmer` to
-/// associate to a device config AP (e.g. a NewHeiko WiFred) for the duration
-/// of a programming job. It never carries hub services, so advertising mDNS
-/// on it would leak `bigfred.local` / dcc-bus beacons onto a customer's
-/// device config network.
+/// Always skips the built-in container/virtual bridge interfaces
+/// (docker/veth/br-*/cni/flannel/virbr). The `skip` list adds extra
+/// case-insensitive **prefix** matches from configuration (e.g. `["wlan"]` on
+/// the BigFred hub, where `wireless-programmer` owns the WiFi radio and mDNS
+/// must not leak onto a device config network). By default `wlan*` is NOT
+/// skipped, so mDNS advertises on WiFi on a generic/laptop install.
 #[must_use]
-pub fn should_skip_iface(name: &str) -> bool {
+pub fn should_skip_iface(name: &str, skip: &[String]) -> bool {
     let n = name.to_ascii_lowercase();
-    n == "docker0"
+    if n == "docker0"
         || n.starts_with("docker")
         || n.starts_with("veth")
         || n.starts_with("br-")
@@ -274,7 +279,13 @@ pub fn should_skip_iface(name: &str) -> bool {
         || n == "cni0"
         || n.starts_with("flannel")
         || n.starts_with("virbr")
-        || n.starts_with("wlan")
+    {
+        return true;
+    }
+    skip.iter().any(|p| {
+        let p = p.trim().to_ascii_lowercase();
+        !p.is_empty() && n.starts_with(&p)
+    })
 }
 
 #[derive(Debug)]
@@ -398,12 +409,15 @@ pub fn dcc_service_entry(
 
 /// Check whether any preferred interface currently has an IPv4 address.
 #[must_use]
-pub fn has_usable_iface() -> bool {
-    !preferred_ipv4_addrs().is_empty()
+pub fn has_usable_iface(skip: &[String]) -> bool {
+    !preferred_ipv4_addrs(skip).is_empty()
 }
 
 /// Return first preferred IP as [`IpAddr`], if any.
 #[must_use]
-pub fn primary_ip() -> Option<IpAddr> {
-    preferred_ipv4_addrs().into_iter().next().map(IpAddr::V4)
+pub fn primary_ip(skip: &[String]) -> Option<IpAddr> {
+    preferred_ipv4_addrs(skip)
+        .into_iter()
+        .next()
+        .map(IpAddr::V4)
 }

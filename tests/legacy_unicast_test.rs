@@ -49,6 +49,7 @@ fn sample_answers() -> AnswerSet {
             (Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(255, 0, 0, 0)),
         ],
         v6: vec![Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)],
+        skip_interfaces: Vec::new(),
     }
 }
 
@@ -227,6 +228,7 @@ fn spawn_echoes_transaction_id_on_ephemeral_port() {
             hosts: vec!["bigfred.local.".into()],
             v4: vec![(Ipv4Addr::new(127, 0, 0, 1), Ipv4Addr::new(255, 0, 0, 0))],
             v6: Vec::new(),
+            skip_interfaces: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         if spawn(Arc::clone(&answers), port, Arc::clone(&stop)).is_err() {

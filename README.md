@@ -54,12 +54,20 @@ Default path: `$DATA_DIR/etc/microdns.json`. Created with defaults if missing.
     "procMs": 2000,
     "mdnsMs": 3000,
     "ifaceMs": 5000
-  }
+  },
+  "skipInterfaces": []
 }
 ```
 
 - `dccBus.enabled` (default `false`): when false, only static `services[]` are advertised.
 - Retry intervals are configurable; config changes are hot-reloaded.
+- `skipInterfaces` (default `[]`): extra interface-name prefixes to skip
+  (case-insensitive), in addition to the built-in docker/veth/br-*/cni/
+  flannel/virbr list. Empty by default so mDNS advertises on every usable
+  interface, including `wlan*` (a laptop on WiFi). Add `["wlan"]` on a hub
+  that reserves the WiFi radio for another purpose (e.g. the BigFred hub,
+  where `wireless-programmer` owns the radio) so mDNS does not leak
+  `bigfred.local` / dcc-bus beacons onto a device config network.
 
 ## Run
 

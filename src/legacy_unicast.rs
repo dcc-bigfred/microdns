@@ -29,6 +29,8 @@ pub struct AnswerSet {
     pub v4: Vec<(Ipv4Addr, Ipv4Addr)>,
     /// Preferred global/ULA IPv6 addresses.
     pub v6: Vec<Ipv6Addr>,
+    /// Configured extra interface-name prefixes to skip (mirrors `Config`).
+    pub skip_interfaces: Vec<String>,
 }
 
 pub const MDNS_PORT: u16 = 5353;
@@ -243,8 +245,13 @@ fn refresh_memberships(
     want_v4.sort_unstable();
     want_v4.dedup();
     // Prefer explicit iface list; also pick up indexes when AnswerSet has no v4
-    // yet (v6-only / A-over-v6 queries).
-    let mut want_idx = mdns::preferred_iface_indexes();
+    // yet (v6-only / A-over-v6 queries). Use the configured skip list so the
+    // indexes stay consistent with the v4/v6 address selection.
+    let skip: Vec<String> = state
+        .read()
+        .map(|g| g.skip_interfaces.clone())
+        .unwrap_or_default();
+    let mut want_idx = mdns::preferred_iface_indexes(&skip);
     want_idx.sort_unstable();
     want_idx.dedup();
 
