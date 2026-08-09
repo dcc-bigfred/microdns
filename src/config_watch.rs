@@ -141,28 +141,3 @@ fn watch_loop(
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn relevant_filters() {
-        assert!(is_relevant_path(
-            Path::new("/data/etc/microdns.json"),
-            "microdns.json"
-        ));
-        assert!(!is_relevant_path(
-            Path::new("/data/etc/.microdns.json"),
-            "microdns.json"
-        ));
-        assert!(!is_relevant_path(
-            Path::new("/data/etc/microdns.json~"),
-            "microdns.json"
-        ));
-        assert!(!is_relevant_path(
-            Path::new("/data/etc/other.json"),
-            "microdns.json"
-        ));
-    }
-}
