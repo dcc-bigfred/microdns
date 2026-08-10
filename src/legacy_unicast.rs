@@ -238,19 +238,22 @@ fn refresh_memberships(
     joined_v4: &mut Vec<Ipv4Addr>,
     joined_ifindexes: &mut Vec<u32>,
 ) {
-    let mut want_v4: Vec<Ipv4Addr> = state
+    // One read, so the addresses and the skip list are guaranteed to come from
+    // the same generation of the AnswerSet.
+    let (mut want_v4, skip): (Vec<Ipv4Addr>, Vec<String>) = state
         .read()
-        .map(|g| g.v4.iter().map(|(ip, _)| *ip).collect())
+        .map(|g| {
+            (
+                g.v4.iter().map(|(ip, _)| *ip).collect(),
+                g.skip_interfaces.clone(),
+            )
+        })
         .unwrap_or_default();
     want_v4.sort_unstable();
     want_v4.dedup();
     // Prefer explicit iface list; also pick up indexes when AnswerSet has no v4
     // yet (v6-only / A-over-v6 queries). Use the configured skip list so the
     // indexes stay consistent with the v4/v6 address selection.
-    let skip: Vec<String> = state
-        .read()
-        .map(|g| g.skip_interfaces.clone())
-        .unwrap_or_default();
     let mut want_idx = mdns::preferred_iface_indexes(&skip);
     want_idx.sort_unstable();
     want_idx.dedup();

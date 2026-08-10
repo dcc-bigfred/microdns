@@ -47,6 +47,29 @@ fn type_field_renames() {
     assert_eq!(cfg.services[0].type_, "_http._tcp");
 }
 
+/// The BigFred OS overlay ships `"skipInterfaces": ["wlan"]`, and nothing else
+/// guards that JSON key: a rename would silently turn the hub's opt-out into a
+/// no-op, since unknown fields are ignored.
+#[test]
+fn skip_interfaces_binds_to_the_camel_case_key() {
+    let json = r#"{
+            "services": [],
+            "skipInterfaces": ["wlan"]
+        }"#;
+    let cfg: Config = serde_json::from_str(json).unwrap();
+    assert_eq!(cfg.skip_interfaces, vec!["wlan".to_string()]);
+}
+
+#[test]
+fn skip_interfaces_defaults_to_empty_when_absent() {
+    let json = r#"{"services": []}"#;
+    let cfg: Config = serde_json::from_str(json).unwrap();
+    assert!(
+        cfg.skip_interfaces.is_empty(),
+        "an existing config file must keep advertising on wlan*"
+    );
+}
+
 #[test]
 fn validate_rejects_bad_dns_sd_type() {
     let mut cfg = Config::default();

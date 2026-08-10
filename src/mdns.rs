@@ -282,9 +282,14 @@ pub fn should_skip_iface(name: &str, skip: &[String]) -> bool {
     {
         return true;
     }
+    // Prefix match without allocating: `n` is already lowercased, so compare
+    // its head case-insensitively. `get` rather than slicing, so an entry whose
+    // byte length lands mid-char cannot panic.
     skip.iter().any(|p| {
-        let p = p.trim().to_ascii_lowercase();
-        !p.is_empty() && n.starts_with(&p)
+        let p = p.trim();
+        !p.is_empty()
+            && n.get(..p.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(p))
     })
 }
 

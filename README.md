@@ -68,6 +68,9 @@ Default path: `$DATA_DIR/etc/microdns.json`. Created with defaults if missing.
   that reserves the WiFi radio for another purpose (e.g. the BigFred hub,
   where `wireless-programmer` owns the radio) so mDNS does not leak
   `bigfred.local` / dcc-bus beacons onto a device config network.
+  Entries are name **prefixes**, not globs or exact names: `"wlan"` covers
+  `wlan0`/`wlan1` but not `wlp3s0`, and a short entry like `"e"` would take
+  `eth0` and `enp1s0` with it, leaving nothing to advertise on.
 
 ## Run
 
