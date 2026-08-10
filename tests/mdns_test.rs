@@ -24,12 +24,25 @@ fn normalize_host() {
 
 #[test]
 fn skip_virtual_ifaces() {
-    assert!(should_skip_iface("veth0abc"));
-    assert!(should_skip_iface("br-1234abcd"));
-    assert!(should_skip_iface("docker0"));
-    assert!(!should_skip_iface("eth0"));
-    assert!(!should_skip_iface("wlan0"));
-    assert!(!should_skip_iface("enp1s0"));
+    // Built-in virtual/container interfaces are always skipped.
+    assert!(should_skip_iface("veth0abc", &[]));
+    assert!(should_skip_iface("br-1234abcd", &[]));
+    assert!(should_skip_iface("docker0", &[]));
+    assert!(!should_skip_iface("eth0", &[]));
+    assert!(!should_skip_iface("enp1s0", &[]));
+    // wlan* is NOT skipped by default (mDNS advertises on WiFi on a laptop).
+    assert!(!should_skip_iface("wlan0", &[]));
+    assert!(!should_skip_iface("WLAN0", &[]));
+    // ...but is skipped when configured (e.g. the BigFred hub reserves the
+    // radio for wireless-programmer). Matching is by name prefix.
+    assert!(should_skip_iface("wlan0", &["wlan".into()]));
+    assert!(should_skip_iface("WLAN0", &["WLAN".into()]));
+    assert!(should_skip_iface("wlan0", &["wlan".into(), "wlp".into()]));
+    assert!(should_skip_iface("wlp3s0", &["wlan".into(), "wlp".into()]));
+    // An empty/blank entry in the skip list matches nothing.
+    assert!(!should_skip_iface("wlan0", &["".into()]));
+    assert!(!should_skip_iface("eth0", &["wlan".into()]));
+    assert!(!should_skip_iface("wlp3s0", &["wlan".into()]));
 }
 
 #[test]

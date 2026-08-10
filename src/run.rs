@@ -85,6 +85,7 @@ pub struct DesiredAds {
     pub dynamic: Vec<DynAd>,
     pub beacons: Vec<BeaconWant>,
     pub ips: Vec<Ipv4Addr>,
+    pub skip_interfaces: Vec<String>,
 }
 
 struct ActiveBeacon {
@@ -145,6 +146,7 @@ pub fn run(config_path: &Path) -> Result<()> {
         dynamic: Vec::new(),
         beacons: Vec::new(),
         ips: Vec::new(),
+        skip_interfaces: Vec::new(),
     };
     let mut registered: HashMap<String, ServiceEntry> = HashMap::new();
 
@@ -166,12 +168,17 @@ pub fn run(config_path: &Path) -> Result<()> {
             }
         }
 
-        let ips = mdns::preferred_ipv4_addrs();
+        let ips = mdns::preferred_ipv4_addrs(&cfg.skip_interfaces);
         if ips.is_empty() {
-            iface_thr.fail(
-                "network interface",
-                &"no UP non-loopback IPv4 (skipping docker/veth/br-*)",
-            );
+            // Name the configured skips too: on a hub with skipInterfaces set,
+            // this is the message an operator sees when the only addressed
+            // interface is the one they told us to ignore.
+            let mut why = String::from("no UP non-loopback IPv4 (skipping docker/veth/br-*");
+            if !cfg.skip_interfaces.is_empty() {
+                why.push_str(&format!(", configured {:?}", cfg.skip_interfaces));
+            }
+            why.push(')');
+            iface_thr.fail("network interface", &why);
         } else {
             iface_thr.ok("network interface");
         }
@@ -187,8 +194,9 @@ pub fn run(config_path: &Path) -> Result<()> {
             }
             let next = AnswerSet {
                 hosts,
-                v4: mdns::preferred_ipv4_ifaces(),
-                v6: mdns::preferred_ipv6_addrs(),
+                v4: mdns::preferred_ipv4_ifaces(&cfg.skip_interfaces),
+                v6: mdns::preferred_ipv6_addrs(&cfg.skip_interfaces),
+                skip_interfaces: cfg.skip_interfaces.clone(),
             };
             if let Ok(mut w) = answer_set.write() {
                 if *w != next {
@@ -202,6 +210,7 @@ pub fn run(config_path: &Path) -> Result<()> {
             dynamic: Vec::new(),
             beacons: Vec::new(),
             ips: ips.clone(),
+            skip_interfaces: cfg.skip_interfaces.clone(),
         };
 
         if cfg.dcc_bus.enabled {
@@ -401,6 +410,7 @@ fn reconcile(
     ips_changed: bool,
 ) -> Result<()> {
     let pub_guard = publisher.lock().unwrap();
+    let skip = &desired.skip_interfaces;
 
     let mut desired_map: HashMap<String, ServiceEntry> = HashMap::new();
     for svc in &desired.static_services {
@@ -417,7 +427,7 @@ fn reconcile(
         if registered.contains_key(key) {
             continue;
         }
-        pub_guard.register(entry, entry.host.as_deref())?;
+        pub_guard.register(entry, entry.host.as_deref(), skip)?;
         registered.insert(key.clone(), entry.clone());
     }
 
@@ -430,7 +440,7 @@ fn reconcile(
             continue;
         }
         let _ = pub_guard.unregister(key);
-        pub_guard.register(entry, entry.host.as_deref())?;
+        pub_guard.register(entry, entry.host.as_deref(), skip)?;
         registered.insert(key.clone(), entry.clone());
     }
 

@@ -130,6 +130,13 @@ pub struct Config {
     pub dcc_bus: DccBusConfig,
     #[serde(default)]
     pub retry: RetryConfig,
+    /// Extra interface name prefixes to skip (case-insensitive), in addition
+    /// to the built-in docker/veth/br-*/... list. Empty by default so mDNS
+    /// advertises on every usable interface (including `wlan*`) — operators
+    /// who reserve the WiFi radio for another purpose (e.g. the BigFred hub,
+    /// where `wireless-programmer` owns the radio) add `["wlan"]` here.
+    #[serde(default)]
+    pub skip_interfaces: Vec<String>,
 }
 
 impl Default for Config {
@@ -145,6 +152,7 @@ impl Default for Config {
             }],
             dcc_bus: DccBusConfig::default(),
             retry: RetryConfig::default(),
+            skip_interfaces: Vec::new(),
         }
     }
 }
