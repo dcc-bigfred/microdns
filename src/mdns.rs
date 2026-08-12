@@ -196,6 +196,7 @@ pub fn preferred_ipv4_ifaces(allow: &[String], skip: &[String]) -> Vec<IfaceAddr
         for (ip, mask) in iface.ipv4 {
             if !ip.is_loopback() && !ip.is_unspecified() {
                 addrs.push(IfaceAddr4 {
+                    iface: iface.name.clone(),
                     addr: ip,
                     mask,
                     ifindex: iface.ifindex,
@@ -222,6 +223,7 @@ pub fn preferred_ipv6_addrs(allow: &[String], skip: &[String]) -> Vec<IfaceAddr6
                 continue;
             }
             addrs.push(IfaceAddr6 {
+                iface: iface.name.clone(),
                 addr: ip,
                 ifindex: iface.ifindex,
             });

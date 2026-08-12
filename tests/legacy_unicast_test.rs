@@ -44,17 +44,20 @@ fn sample_answers() -> AnswerSet {
         hosts: vec!["bigfred.local.".into()],
         v4: vec![
             IfaceAddr4 {
+                iface: "eth0".into(),
                 addr: Ipv4Addr::new(192, 168, 1, 10),
                 mask: Ipv4Addr::new(255, 255, 255, 0),
                 ifindex: 2, // eth0
             },
             IfaceAddr4 {
+                iface: "wlan0".into(),
                 addr: Ipv4Addr::new(10, 0, 0, 5),
                 mask: Ipv4Addr::new(255, 0, 0, 0),
                 ifindex: 3, // wlan0
             },
         ],
         v6: vec![IfaceAddr6 {
+            iface: "eth0".into(),
             addr: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
             ifindex: 2,
         }],
@@ -141,6 +144,7 @@ fn choose_v4_for_iface_prefers_receiving_iface() {
 fn choose_v4_for_iface_same_subnet_within_iface() {
     let mut answers = sample_answers();
     answers.v4.push(IfaceAddr4 {
+        iface: "wlan0".into(),
         addr: Ipv4Addr::new(10, 1, 0, 5),
         mask: Ipv4Addr::new(255, 255, 0, 0),
         ifindex: 3,
@@ -160,6 +164,7 @@ fn choose_v4_for_iface_falls_back_without_ifindex() {
 fn choose_v6_for_iface_prefers_receiving_iface() {
     let mut answers = sample_answers();
     answers.v6.push(IfaceAddr6 {
+        iface: "wlan0".into(),
         addr: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2),
         ifindex: 3,
     });
@@ -279,6 +284,7 @@ fn spawn_echoes_transaction_id_on_ephemeral_port() {
         let answers = Arc::new(RwLock::new(AnswerSet {
             hosts: vec!["bigfred.local.".into()],
             v4: vec![IfaceAddr4 {
+                iface: "lo".into(),
                 addr: Ipv4Addr::new(127, 0, 0, 1),
                 mask: Ipv4Addr::new(255, 0, 0, 0),
                 ifindex: 1,

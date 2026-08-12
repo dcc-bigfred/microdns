@@ -24,16 +24,20 @@ use crate::mdns;
 use crate::sys;
 
 /// IPv4 address bound to a specific interface (for per-iface replies).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IfaceAddr4 {
+    /// Kernel interface name, e.g. `"eth0"` / `"wlan0"`.
+    pub iface: String,
     pub addr: Ipv4Addr,
     pub mask: Ipv4Addr,
     pub ifindex: u32,
 }
 
 /// IPv6 address bound to a specific interface (for per-iface replies).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IfaceAddr6 {
+    /// Kernel interface name, e.g. `"eth0"` / `"wlan0"`.
+    pub iface: String,
     pub addr: Ipv6Addr,
     pub ifindex: u32,
 }
@@ -264,16 +268,19 @@ fn refresh_memberships(
 ) {
     // One read, so the addresses and the skip/allow lists are from the same
     // generation of the AnswerSet.
-    let (mut want_v4, allow, skip): (Vec<Ipv4Addr>, Vec<String>, Vec<String>) = state
+    let (v4, v6, allow, skip) = state
         .read()
         .map(|g| {
             (
-                g.v4.iter().map(|a| a.addr).collect(),
+                g.v4.clone(),
+                g.v6.clone(),
                 g.interfaces.clone(),
                 g.skip_interfaces.clone(),
             )
         })
         .unwrap_or_default();
+
+    let mut want_v4: Vec<Ipv4Addr> = v4.iter().map(|a| a.addr).collect();
     want_v4.sort_unstable();
     want_v4.dedup();
     let mut want_idx = mdns::preferred_iface_indexes(&allow, &skip);
@@ -286,10 +293,24 @@ fn refresh_memberships(
                 let _ = sock.leave_multicast_v4(&MDNS_GROUP_V4, ip);
             }
             joined_v4.clear();
-            for ip in &want_v4 {
-                match sock.join_multicast_v4(&MDNS_GROUP_V4, ip) {
-                    Ok(()) => joined_v4.push(*ip),
-                    Err(e) => log::debug!("join multicast v4 on {ip}: {e}"),
+            for a in &v4 {
+                match sock.join_multicast_v4(&MDNS_GROUP_V4, &a.addr) {
+                    Ok(()) => {
+                        log::info!(
+                            "mDNS multicast joined iface={} ifindex={} group={MDNS_GROUP_V4} local={}",
+                            a.iface,
+                            a.ifindex,
+                            a.addr
+                        );
+                        if !joined_v4.contains(&a.addr) {
+                            joined_v4.push(a.addr);
+                        }
+                    }
+                    Err(e) => log::warn!(
+                        "mDNS multicast join failed iface={} local={}: {e}",
+                        a.iface,
+                        a.addr
+                    ),
                 }
             }
         }
@@ -302,9 +323,31 @@ fn refresh_memberships(
             }
             joined_ifindexes.clear();
             for idx in &want_idx {
+                let iface_label = v6
+                    .iter()
+                    .find(|a| a.ifindex == *idx)
+                    .map(|a| a.iface.as_str())
+                    .or_else(|| {
+                        v4.iter()
+                            .find(|a| a.ifindex == *idx)
+                            .map(|a| a.iface.as_str())
+                    })
+                    .unwrap_or("?");
+                let local_v6: Vec<String> = v6
+                    .iter()
+                    .filter(|a| a.ifindex == *idx)
+                    .map(|a| a.addr.to_string())
+                    .collect();
                 match sock.join_multicast_v6(&MDNS_GROUP_V6, *idx) {
-                    Ok(()) => joined_ifindexes.push(*idx),
-                    Err(e) => log::debug!("join multicast v6 ifindex {idx}: {e}"),
+                    Ok(()) => {
+                        log::info!(
+                            "mDNS multicast joined iface={iface_label} ifindex={idx} group={MDNS_GROUP_V6} local_v6={local_v6:?}"
+                        );
+                        joined_ifindexes.push(*idx);
+                    }
+                    Err(e) => log::warn!(
+                        "mDNS multicast join failed iface={iface_label} ifindex={idx}: {e}"
+                    ),
                 }
             }
         }

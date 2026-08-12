@@ -219,6 +219,7 @@ pub fn run(config_path: &Path) -> Result<()> {
             };
             if let Ok(mut w) = answer_set.write() {
                 if *w != next {
+                    log_detected_interfaces(&next);
                     *w = next;
                 }
             }
@@ -533,6 +534,55 @@ fn lock_mutex<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
             log::warn!("mutex poisoned; recovering inner state");
             poisoned.into_inner()
         }
+    }
+}
+
+/// Log usable interfaces and their addresses when the advertisement set changes.
+fn log_detected_interfaces(answers: &AnswerSet) {
+    if answers.v4.is_empty() && answers.v6.is_empty() {
+        log::info!("network interfaces: none usable for mDNS");
+        return;
+    }
+
+    // Group by interface name so one line lists all addresses for that iface.
+    let mut names: Vec<String> = answers
+        .v4
+        .iter()
+        .map(|a| a.iface.clone())
+        .chain(answers.v6.iter().map(|a| a.iface.clone()))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+
+    for name in names {
+        let v4: Vec<String> = answers
+            .v4
+            .iter()
+            .filter(|a| a.iface == name)
+            .map(|a| format!("{} (ifindex={})", a.addr, a.ifindex))
+            .collect();
+        let v6: Vec<String> = answers
+            .v6
+            .iter()
+            .filter(|a| a.iface == name)
+            .map(|a| format!("{} (ifindex={})", a.addr, a.ifindex))
+            .collect();
+        let ifindex = answers
+            .v4
+            .iter()
+            .find(|a| a.iface == name)
+            .map(|a| a.ifindex)
+            .or_else(|| {
+                answers
+                    .v6
+                    .iter()
+                    .find(|a| a.iface == name)
+                    .map(|a| a.ifindex)
+            })
+            .unwrap_or(0);
+        log::info!(
+            "network interface detected name={name} ifindex={ifindex} ipv4={v4:?} ipv6={v6:?} multicast_group=224.0.0.251"
+        );
     }
 }
 
