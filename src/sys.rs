@@ -173,10 +173,8 @@ pub fn recv_with_pktinfo(sock: &Socket, is_v6: bool) -> std::io::Result<Option<R
         msg.msg_iov = iov.as_mut_ptr().cast();
         msg.msg_iovlen = 1;
         msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = control
-            .len()
-            .try_into()
-            .expect("CMSG buffer size fits in msg_controllen");
+        // msghdr.msg_controllen is size_t on glibc and u32 on musl.
+        msg.msg_controllen = control.len() as _;
         let n = libc::recvmsg(sock.as_raw_fd(), &mut msg, 0);
         if n < 0 {
             (n, None)
