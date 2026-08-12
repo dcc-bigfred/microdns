@@ -28,7 +28,9 @@ fn append_station_builds_identity() {
         dynamic: Vec::new(),
         beacons: Vec::new(),
         ips: Vec::new(),
+        ips_v6: Vec::new(),
         skip_interfaces: Vec::new(),
+        interfaces: Vec::new(),
     };
     let mut ports = ListenPorts {
         tcp: HashSet::new(),

@@ -71,6 +71,44 @@ fn skip_interfaces_defaults_to_empty_when_absent() {
 }
 
 #[test]
+fn interfaces_defaults_to_empty_when_absent() {
+    let json = r#"{"services": []}"#;
+    let cfg: Config = serde_json::from_str(json).unwrap();
+    assert!(
+        cfg.interfaces.is_empty(),
+        "empty interfaces means advertise on all usable ifaces"
+    );
+}
+
+#[test]
+fn interfaces_binds_to_the_camel_case_key() {
+    let json = r#"{
+            "services": [],
+            "interfaces": ["eth", "enp"]
+        }"#;
+    let cfg: Config = serde_json::from_str(json).unwrap();
+    assert_eq!(cfg.interfaces, vec!["eth".to_string(), "enp".to_string()]);
+}
+
+#[test]
+fn validate_rejects_duplicate_interfaces() {
+    let cfg = Config {
+        interfaces: vec!["eth".into(), "ETH".into()],
+        ..Config::default()
+    };
+    assert!(cfg.validate().is_err());
+}
+
+#[test]
+fn validate_rejects_empty_interface_entry() {
+    let cfg = Config {
+        interfaces: vec!["  ".into()],
+        ..Config::default()
+    };
+    assert!(cfg.validate().is_err());
+}
+
+#[test]
 fn validate_rejects_bad_dns_sd_type() {
     let mut cfg = Config::default();
     cfg.services[0].type_ = "_http._sctp".into();

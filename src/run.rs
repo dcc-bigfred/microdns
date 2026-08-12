@@ -1,7 +1,7 @@
 //! Main daemon loop: orchestrates config watch, mDNS, dcc-bus discovery, beacon.
 
 use std::collections::{HashMap, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -12,6 +12,7 @@ use crate::beacon::{self, virtual_serial};
 use crate::config::{self, Config, ServiceEntry};
 use crate::config_watch::{self, ReloadSignal};
 use crate::error::Result;
+use crate::iface_watch::{self, IfaceChange};
 use crate::legacy_unicast::{self, AnswerSet};
 use crate::mdns::{self, MdnsPublisher};
 use crate::microinit_watch;
@@ -78,14 +79,17 @@ pub struct BeaconWant {
 
 /// Desired advertisement set derived from config + empirical dcc-bus state.
 ///
-/// `ips` is included so DHCP / interface address changes trigger re-registration.
+/// `ips` (IPv4) and `ips_v6` (IPv6) are both included so DHCP / SLAAC privacy
+/// address churn triggers re-registration of A/AAAA via mdns-sd.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesiredAds {
     pub static_services: Vec<ServiceEntry>,
     pub dynamic: Vec<DynAd>,
     pub beacons: Vec<BeaconWant>,
     pub ips: Vec<Ipv4Addr>,
+    pub ips_v6: Vec<Ipv6Addr>,
     pub skip_interfaces: Vec<String>,
+    pub interfaces: Vec<String>,
 }
 
 struct ActiveBeacon {
@@ -113,6 +117,14 @@ pub fn run(config_path: &Path) -> Result<()> {
 
     let stop = Arc::new(AtomicBool::new(false));
     let (reload_rx, watch_stop) = config_watch::spawn(config_path.to_path_buf())?;
+    let (iface_rx, iface_watch_stop) = match iface_watch::spawn() {
+        Ok(pair) => pair,
+        Err(e) => {
+            log::warn!("iface watcher failed to start: {e}; relying on polling");
+            let (_tx, rx) = std::sync::mpsc::channel::<IfaceChange>();
+            (rx, Arc::new(AtomicBool::new(true)))
+        }
+    };
 
     let publisher = Arc::new(Mutex::new(MdnsPublisher::new()));
     let beacons: Arc<Mutex<Vec<ActiveBeacon>>> = Arc::new(Mutex::new(Vec::new()));
@@ -146,43 +158,57 @@ pub fn run(config_path: &Path) -> Result<()> {
         dynamic: Vec::new(),
         beacons: Vec::new(),
         ips: Vec::new(),
+        ips_v6: Vec::new(),
         skip_interfaces: Vec::new(),
+        interfaces: Vec::new(),
     };
     let mut registered: HashMap<String, ServiceEntry> = HashMap::new();
 
     while !signals::shutdown_requested() && !stop.load(Ordering::SeqCst) {
         let cfg = shared.config.read().map(|c| c.clone()).unwrap_or_default();
-
-        let retry = cfg.retry.clone();
+        let mdns_ms = cfg.retry.mdns_ms;
 
         // Ensure mDNS daemon (quiet retry).
         {
-            let mut pub_guard = publisher.lock().unwrap();
+            let mut pub_guard = lock_mutex(&publisher);
             match pub_guard.ensure_daemon() {
                 Ok(()) => mdns_thr.ok("mDNS daemon"),
                 Err(e) => {
                     mdns_thr.fail("mDNS daemon", &e);
-                    sleep_interruptible(Duration::from_millis(retry.mdns_ms));
+                    sleep_or_iface(&iface_rx, Duration::from_millis(mdns_ms));
                     continue;
                 }
             }
         }
 
-        let ips = mdns::preferred_ipv4_addrs(&cfg.skip_interfaces);
+        let ips = mdns::preferred_ipv4_addrs(&cfg.interfaces, &cfg.skip_interfaces);
+        let ips_v6: Vec<Ipv6Addr> =
+            mdns::preferred_ipv6_addrs(&cfg.interfaces, &cfg.skip_interfaces)
+                .into_iter()
+                .map(|a| a.addr)
+                .collect();
         if ips.is_empty() {
-            // Name the configured skips too: on a hub with skipInterfaces set,
-            // this is the message an operator sees when the only addressed
-            // interface is the one they told us to ignore.
-            let mut why = String::from("no UP non-loopback IPv4 (skipping docker/veth/br-*");
-            if !cfg.skip_interfaces.is_empty() {
-                why.push_str(&format!(", configured {:?}", cfg.skip_interfaces));
-            }
-            why.push(')');
+            let why = if !cfg.interfaces.is_empty() {
+                format!(
+                    "none of configured interfaces present/usable (interfaces={:?}, skip={:?})",
+                    cfg.interfaces, cfg.skip_interfaces
+                )
+            } else {
+                let mut why = String::from("no UP non-loopback IPv4 (skipping docker/veth/br-*");
+                if !cfg.skip_interfaces.is_empty() {
+                    why.push_str(&format!(", configured {:?}", cfg.skip_interfaces));
+                }
+                why.push(')');
+                why
+            };
             iface_thr.fail("network interface", &why);
         } else {
             iface_thr.ok("network interface");
         }
 
+        // Take interface lists once; AnswerSet clones, DesiredAds owns.
+        let interfaces = cfg.interfaces;
+        let skip_interfaces = cfg.skip_interfaces;
         {
             let mut hosts = Vec::new();
             for svc in &cfg.services {
@@ -194,26 +220,35 @@ pub fn run(config_path: &Path) -> Result<()> {
             }
             let next = AnswerSet {
                 hosts,
-                v4: mdns::preferred_ipv4_ifaces(&cfg.skip_interfaces),
-                v6: mdns::preferred_ipv6_addrs(&cfg.skip_interfaces),
-                skip_interfaces: cfg.skip_interfaces.clone(),
+                v4: mdns::preferred_ipv4_ifaces(&interfaces, &skip_interfaces),
+                v6: mdns::preferred_ipv6_addrs(&interfaces, &skip_interfaces),
+                skip_interfaces: skip_interfaces.clone(),
+                interfaces: interfaces.clone(),
             };
             if let Ok(mut w) = answer_set.write() {
                 if *w != next {
+                    log_detected_interfaces(&next);
                     *w = next;
                 }
             }
         }
 
         let mut desired = DesiredAds {
-            static_services: cfg.services.clone(),
+            static_services: cfg.services,
             dynamic: Vec::new(),
             beacons: Vec::new(),
-            ips: ips.clone(),
-            skip_interfaces: cfg.skip_interfaces.clone(),
+            ips,
+            ips_v6,
+            skip_interfaces,
+            interfaces,
         };
+        let dcc_enabled = cfg.dcc_bus.enabled;
+        let z21_port = cfg.dcc_bus.z21_port;
+        let withrottle_port = cfg.dcc_bus.withrottle_port;
+        let beacon = cfg.dcc_bus.beacon;
+        let retry = cfg.retry;
 
-        if cfg.dcc_bus.enabled {
+        if dcc_enabled {
             let sock = config::default_microinit_socket();
             match microinit_watch::list_dcc_bus_services(&sock) {
                 Ok(services) => {
@@ -227,7 +262,9 @@ pub fn run(config_path: &Path) -> Result<()> {
                         microinit_thr.ok("microinit dcc-bus");
                         let mut any_scan_ok = false;
                         for st in &running {
-                            let pid = st.pid.unwrap();
+                            let Some(pid) = st.pid else {
+                                continue;
+                            };
                             match proc_scan::listen_ports_for_pid(pid) {
                                 Ok(ports) => {
                                     any_scan_ok = true;
@@ -235,9 +272,9 @@ pub fn run(config_path: &Path) -> Result<()> {
                                         &mut desired,
                                         &st.name,
                                         &ports,
-                                        cfg.dcc_bus.z21_port,
-                                        cfg.dcc_bus.withrottle_port,
-                                        cfg.dcc_bus.beacon,
+                                        z21_port,
+                                        withrottle_port,
+                                        beacon,
                                     );
                                 }
                                 Err(e) => proc_thr.fail("proc listen scan", &e),
@@ -265,7 +302,10 @@ pub fn run(config_path: &Path) -> Result<()> {
 
         // Reconcile advertisements when desired set changes (incl. IP churn).
         if desired != last_desired {
-            let ips_changed = desired.ips != last_desired.ips;
+            let ips_changed = desired.ips != last_desired.ips
+                || desired.ips_v6 != last_desired.ips_v6
+                || desired.interfaces != last_desired.interfaces
+                || desired.skip_interfaces != last_desired.skip_interfaces;
             if let Err(e) = reconcile(&publisher, &desired, &mut registered, &beacons, ips_changed)
             {
                 mdns_thr.fail("mDNS register", &e);
@@ -275,24 +315,27 @@ pub fn run(config_path: &Path) -> Result<()> {
             }
         }
 
-        // Sleep until next poll; wake early on shutdown.
-        let sleep_ms = if cfg.dcc_bus.enabled {
+        // Sleep until next poll; wake early on shutdown or netlink iface change.
+        let sleep_ms = if dcc_enabled {
             retry.proc_ms.min(retry.microinit_ms).min(retry.iface_ms)
         } else {
             retry.iface_ms.min(retry.mdns_ms)
         };
-        sleep_interruptible(Duration::from_millis(sleep_ms.max(500)));
+        sleep_or_iface(&iface_rx, Duration::from_millis(sleep_ms.max(500)));
     }
 
     log::info!("microdns shutting down");
     stop.store(true, Ordering::SeqCst);
     watch_stop.store(true, Ordering::SeqCst);
-    if let Ok(mut active) = beacons.lock() {
+    iface_watch_stop.store(true, Ordering::SeqCst);
+    {
+        let mut active = lock_mutex(&beacons);
         for b in active.drain(..) {
             b.stop.store(true, Ordering::SeqCst);
         }
     }
-    if let Ok(mut p) = publisher.lock() {
+    {
+        let mut p = lock_mutex(&publisher);
         p.shutdown();
     }
     Ok(())
@@ -409,7 +452,8 @@ fn reconcile(
     beacons: &Arc<Mutex<Vec<ActiveBeacon>>>,
     ips_changed: bool,
 ) -> Result<()> {
-    let pub_guard = publisher.lock().unwrap();
+    let pub_guard = lock_mutex(publisher);
+    let allow = &desired.interfaces;
     let skip = &desired.skip_interfaces;
 
     let mut desired_map: HashMap<String, ServiceEntry> = HashMap::new();
@@ -427,7 +471,7 @@ fn reconcile(
         if registered.contains_key(key) {
             continue;
         }
-        pub_guard.register(entry, entry.host.as_deref(), skip)?;
+        pub_guard.register(entry, entry.host.as_deref(), allow, skip)?;
         registered.insert(key.clone(), entry.clone());
     }
 
@@ -440,7 +484,7 @@ fn reconcile(
             continue;
         }
         let _ = pub_guard.unregister(key);
-        pub_guard.register(entry, entry.host.as_deref(), skip)?;
+        pub_guard.register(entry, entry.host.as_deref(), allow, skip)?;
         registered.insert(key.clone(), entry.clone());
     }
 
@@ -463,7 +507,7 @@ fn reconcile(
 
 fn reconcile_beacons(beacons: &Arc<Mutex<Vec<ActiveBeacon>>>, want: &[BeaconWant]) -> Result<()> {
     let want_set: HashSet<&BeaconWant> = want.iter().collect();
-    let mut active = beacons.lock().unwrap();
+    let mut active = lock_mutex(beacons);
 
     active.retain(|b| {
         if want_set.contains(&b.want) {
@@ -490,13 +534,86 @@ fn reconcile_beacons(beacons: &Arc<Mutex<Vec<ActiveBeacon>>>, want: &[BeaconWant
     Ok(())
 }
 
-fn sleep_interruptible(total: Duration) {
+/// Recover from a poisoned mutex: a poisoned lock means another thread panicked
+/// while holding it. Prefer continuing with the inner value over crashing the
+/// daemon (reliability contract: warn, do not abort).
+fn lock_mutex<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::warn!("mutex poisoned; recovering inner state");
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// Log usable interfaces and their addresses when the advertisement set changes.
+fn log_detected_interfaces(answers: &AnswerSet) {
+    if answers.v4.is_empty() && answers.v6.is_empty() {
+        log::info!("network interfaces: none usable for mDNS");
+        return;
+    }
+
+    // Group by interface name so one line lists all addresses for that iface.
+    let mut names: Vec<String> = answers
+        .v4
+        .iter()
+        .map(|a| a.iface.clone())
+        .chain(answers.v6.iter().map(|a| a.iface.clone()))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+
+    for name in names {
+        let v4: Vec<String> = answers
+            .v4
+            .iter()
+            .filter(|a| a.iface == name)
+            .map(|a| format!("{} (ifindex={})", a.addr, a.ifindex))
+            .collect();
+        let v6: Vec<String> = answers
+            .v6
+            .iter()
+            .filter(|a| a.iface == name)
+            .map(|a| format!("{} (ifindex={})", a.addr, a.ifindex))
+            .collect();
+        let ifindex = answers
+            .v4
+            .iter()
+            .find(|a| a.iface == name)
+            .map(|a| a.ifindex)
+            .or_else(|| {
+                answers
+                    .v6
+                    .iter()
+                    .find(|a| a.iface == name)
+                    .map(|a| a.ifindex)
+            })
+            .unwrap_or(0);
+        log::info!(
+            "network interface detected name={name} ifindex={ifindex} ipv4={v4:?} ipv6={v6:?} multicast_group=224.0.0.251"
+        );
+    }
+}
+
+/// Sleep until `total` elapses, shutdown is requested, or a netlink iface change arrives.
+fn sleep_or_iface(iface_rx: &std::sync::mpsc::Receiver<IfaceChange>, total: Duration) {
     let deadline = Instant::now() + total;
     while Instant::now() < deadline {
         if signals::shutdown_requested() {
             return;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        thread::sleep(remaining.min(Duration::from_millis(200)));
+        let slice = remaining.min(Duration::from_millis(200));
+        match iface_watch::recv_timeout(iface_rx, slice) {
+            Ok(IfaceChange) => {
+                log::debug!("iface change signaled; refreshing");
+                return;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                thread::sleep(slice);
+            }
+        }
     }
 }
