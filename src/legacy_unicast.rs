@@ -313,6 +313,11 @@ fn refresh_memberships(
                     ),
                 }
             }
+            // Compare as sorted sets so re-deriving `want_v4` (sorted+deduped)
+            // doesn't flap membership when the join order differs from the
+            // declaration order.
+            joined_v4.sort_unstable();
+            joined_v4.dedup();
         }
     }
 

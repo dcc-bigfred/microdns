@@ -1,7 +1,7 @@
 //! Main daemon loop: orchestrates config watch, mDNS, dcc-bus discovery, beacon.
 
 use std::collections::{HashMap, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -79,13 +79,15 @@ pub struct BeaconWant {
 
 /// Desired advertisement set derived from config + empirical dcc-bus state.
 ///
-/// `ips` is included so DHCP / interface address changes trigger re-registration.
+/// `ips` (IPv4) and `ips_v6` (IPv6) are both included so DHCP / SLAAC privacy
+/// address churn triggers re-registration of A/AAAA via mdns-sd.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesiredAds {
     pub static_services: Vec<ServiceEntry>,
     pub dynamic: Vec<DynAd>,
     pub beacons: Vec<BeaconWant>,
     pub ips: Vec<Ipv4Addr>,
+    pub ips_v6: Vec<Ipv6Addr>,
     pub skip_interfaces: Vec<String>,
     pub interfaces: Vec<String>,
 }
@@ -156,6 +158,7 @@ pub fn run(config_path: &Path) -> Result<()> {
         dynamic: Vec::new(),
         beacons: Vec::new(),
         ips: Vec::new(),
+        ips_v6: Vec::new(),
         skip_interfaces: Vec::new(),
         interfaces: Vec::new(),
     };
@@ -179,6 +182,10 @@ pub fn run(config_path: &Path) -> Result<()> {
         }
 
         let ips = mdns::preferred_ipv4_addrs(&cfg.interfaces, &cfg.skip_interfaces);
+        let ips_v6: Vec<Ipv6Addr> = mdns::preferred_ipv6_addrs(&cfg.interfaces, &cfg.skip_interfaces)
+            .into_iter()
+            .map(|a| a.addr)
+            .collect();
         if ips.is_empty() {
             let why = if !cfg.interfaces.is_empty() {
                 format!(
@@ -230,6 +237,7 @@ pub fn run(config_path: &Path) -> Result<()> {
             dynamic: Vec::new(),
             beacons: Vec::new(),
             ips,
+            ips_v6,
             skip_interfaces,
             interfaces,
         };
@@ -294,6 +302,7 @@ pub fn run(config_path: &Path) -> Result<()> {
         // Reconcile advertisements when desired set changes (incl. IP churn).
         if desired != last_desired {
             let ips_changed = desired.ips != last_desired.ips
+                || desired.ips_v6 != last_desired.ips_v6
                 || desired.interfaces != last_desired.interfaces
                 || desired.skip_interfaces != last_desired.skip_interfaces;
             if let Err(e) = reconcile(&publisher, &desired, &mut registered, &beacons, ips_changed)
