@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use microdns::legacy_unicast::{
     build_response, choose_v4, choose_v4_for_iface, choose_v6_for_iface, hosts_match, parse_query,
-    spawn, AnswerSet, ParsedQuery, LEGACY_TTL, QTYPE_A, QTYPE_AAAA, QTYPE_ANY,
+    spawn, AnswerSet, IfaceAddr4, IfaceAddr6, ParsedQuery, LEGACY_TTL, QTYPE_A, QTYPE_AAAA,
+    QTYPE_ANY,
 };
 
 fn encode_name(name: &str) -> Vec<u8> {
@@ -42,18 +43,21 @@ fn sample_answers() -> AnswerSet {
     AnswerSet {
         hosts: vec!["bigfred.local.".into()],
         v4: vec![
-            (
-                Ipv4Addr::new(192, 168, 1, 10),
-                Ipv4Addr::new(255, 255, 255, 0),
-                2, // eth0
-            ),
-            (
-                Ipv4Addr::new(10, 0, 0, 5),
-                Ipv4Addr::new(255, 0, 0, 0),
-                3, // wlan0
-            ),
+            IfaceAddr4 {
+                addr: Ipv4Addr::new(192, 168, 1, 10),
+                mask: Ipv4Addr::new(255, 255, 255, 0),
+                ifindex: 2, // eth0
+            },
+            IfaceAddr4 {
+                addr: Ipv4Addr::new(10, 0, 0, 5),
+                mask: Ipv4Addr::new(255, 0, 0, 0),
+                ifindex: 3, // wlan0
+            },
         ],
-        v6: vec![(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 2)],
+        v6: vec![IfaceAddr6 {
+            addr: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            ifindex: 2,
+        }],
         skip_interfaces: Vec::new(),
         interfaces: Vec::new(),
     }
@@ -136,9 +140,11 @@ fn choose_v4_for_iface_prefers_receiving_iface() {
 #[test]
 fn choose_v4_for_iface_same_subnet_within_iface() {
     let mut answers = sample_answers();
-    answers
-        .v4
-        .push((Ipv4Addr::new(10, 1, 0, 5), Ipv4Addr::new(255, 255, 0, 0), 3));
+    answers.v4.push(IfaceAddr4 {
+        addr: Ipv4Addr::new(10, 1, 0, 5),
+        mask: Ipv4Addr::new(255, 255, 0, 0),
+        ifindex: 3,
+    });
     let chosen = choose_v4_for_iface(&answers, Ipv4Addr::new(10, 0, 0, 99), Some(3));
     assert_eq!(chosen, vec![Ipv4Addr::new(10, 0, 0, 5)]);
 }
@@ -153,9 +159,10 @@ fn choose_v4_for_iface_falls_back_without_ifindex() {
 #[test]
 fn choose_v6_for_iface_prefers_receiving_iface() {
     let mut answers = sample_answers();
-    answers
-        .v6
-        .push((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2), 3));
+    answers.v6.push(IfaceAddr6 {
+        addr: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2),
+        ifindex: 3,
+    });
     let chosen = choose_v6_for_iface(&answers, Some(3));
     assert_eq!(chosen, vec![Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)]);
 }
@@ -257,14 +264,6 @@ fn build_any_includes_a_and_aaaa() {
 
 #[test]
 fn spawn_echoes_transaction_id_on_ephemeral_port() {
-    // To avoid racing another process for an ephemeral port, we retry the
-    // whole bind-spawn-query cycle a few times. Each attempt:
-    //   1. Probe-binds 127.0.0.1:0 to discover a free port P.
-    //   2. Drops the probe and immediately spawns the responder on P.
-    //      (SO_REUSEPORT lets the responder bind even if a stray process
-    //      grabbed P in the tiny window.)
-    //   3. Client binds a *different* ephemeral port Q and queries P.
-    // If we never get a reply, we discard this attempt and try a new port.
     let query_id = 0xabcd;
     let pkt = build_query(query_id, "bigfred.local.", QTYPE_A, 1);
 
@@ -279,7 +278,11 @@ fn spawn_echoes_transaction_id_on_ephemeral_port() {
 
         let answers = Arc::new(RwLock::new(AnswerSet {
             hosts: vec!["bigfred.local.".into()],
-            v4: vec![(Ipv4Addr::new(127, 0, 0, 1), Ipv4Addr::new(255, 0, 0, 0), 1)],
+            v4: vec![IfaceAddr4 {
+                addr: Ipv4Addr::new(127, 0, 0, 1),
+                mask: Ipv4Addr::new(255, 0, 0, 0),
+                ifindex: 1,
+            }],
             v6: Vec::new(),
             skip_interfaces: Vec::new(),
             interfaces: Vec::new(),
@@ -323,7 +326,6 @@ fn spawn_echoes_transaction_id_on_ephemeral_port() {
 
     let resp = got.expect("timed out waiting for legacy unicast reply after 5 attempts");
     assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), query_id);
-    // TTL check on first answer
     let mut pos = 12usize;
     while pos < resp.len() && resp[pos] != 0 {
         pos += 1 + resp[pos] as usize;

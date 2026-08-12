@@ -22,3 +22,12 @@ jobs:
       binaries: '[{"name":"microdns","dist":"microdns-linux"}]'
       build_env: |
         MICRODNS_GIT_COMMIT=${{ github.sha }}
+
+  # Guidelines §17.2: optimized tests with debug-assertions / overflow-checks.
+  release-assertions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo test --profile release-assertions
+        run: cargo test --profile release-assertions --locked

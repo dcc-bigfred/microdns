@@ -12,6 +12,7 @@ use mdns_sd::{ServiceDaemon, ServiceInfo};
 
 use crate::config::ServiceEntry;
 use crate::error::{Error, Result};
+use crate::legacy_unicast::{IfaceAddr4, IfaceAddr6};
 use crate::version;
 
 /// Tracked registrations keyed by full service name.
@@ -177,13 +178,13 @@ pub fn normalize_hostname(host: &str) -> String {
 pub fn preferred_ipv4_addrs(allow: &[String], skip: &[String]) -> Vec<Ipv4Addr> {
     preferred_ipv4_ifaces(allow, skip)
         .into_iter()
-        .map(|(ip, _mask, _ifindex)| ip)
+        .map(|a| a.addr)
         .collect()
 }
 
 /// Preferred IPv4 addresses with netmasks and ifindex (for per-iface replies).
 #[must_use]
-pub fn preferred_ipv4_ifaces(allow: &[String], skip: &[String]) -> Vec<(Ipv4Addr, Ipv4Addr, u32)> {
+pub fn preferred_ipv4_ifaces(allow: &[String], skip: &[String]) -> Vec<IfaceAddr4> {
     let mut addrs = Vec::new();
     let Ok(ifaces) = list_interfaces() else {
         return addrs;
@@ -194,7 +195,11 @@ pub fn preferred_ipv4_ifaces(allow: &[String], skip: &[String]) -> Vec<(Ipv4Addr
         }
         for (ip, mask) in iface.ipv4 {
             if !ip.is_loopback() && !ip.is_unspecified() {
-                addrs.push((ip, mask, iface.ifindex));
+                addrs.push(IfaceAddr4 {
+                    addr: ip,
+                    mask,
+                    ifindex: iface.ifindex,
+                });
             }
         }
     }
@@ -203,7 +208,7 @@ pub fn preferred_ipv4_ifaces(allow: &[String], skip: &[String]) -> Vec<(Ipv4Addr
 
 /// Preferred global/ULA IPv6 addresses with ifindex (no loopback/unspecified/link-local).
 #[must_use]
-pub fn preferred_ipv6_addrs(allow: &[String], skip: &[String]) -> Vec<(Ipv6Addr, u32)> {
+pub fn preferred_ipv6_addrs(allow: &[String], skip: &[String]) -> Vec<IfaceAddr6> {
     let mut addrs = Vec::new();
     let Ok(ifaces) = list_interfaces() else {
         return addrs;
@@ -216,7 +221,10 @@ pub fn preferred_ipv6_addrs(allow: &[String], skip: &[String]) -> Vec<(Ipv6Addr,
             if ip.is_loopback() || ip.is_unspecified() || is_ipv6_link_local(&ip) {
                 continue;
             }
-            addrs.push((ip, iface.ifindex));
+            addrs.push(IfaceAddr6 {
+                addr: ip,
+                ifindex: iface.ifindex,
+            });
         }
     }
     addrs

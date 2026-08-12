@@ -11,29 +11,42 @@
 //! Remove the legacy ID-echo path when upstream fixes `DnsOutgoing` multicast /
 //! id encoding; keep the per-interface selection.
 
-use std::io::{ErrorKind, IoSliceMut};
-use std::mem::{self, MaybeUninit};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use socket2::{Domain, Protocol, SockAddr, SockAddrStorage, Socket, Type};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use crate::error::{Error, Result};
 use crate::mdns;
+use crate::sys;
+
+/// IPv4 address bound to a specific interface (for per-iface replies).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IfaceAddr4 {
+    pub addr: Ipv4Addr,
+    pub mask: Ipv4Addr,
+    pub ifindex: u32,
+}
+
+/// IPv6 address bound to a specific interface (for per-iface replies).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IfaceAddr6 {
+    pub addr: Ipv6Addr,
+    pub ifindex: u32,
+}
 
 /// Hosts and addresses answered for A/AAAA queries.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct AnswerSet {
     /// Normalized hosts, e.g. `"bigfred.local."`.
     pub hosts: Vec<String>,
-    /// Preferred IPv4 addresses: `(addr, mask, ifindex)`.
-    pub v4: Vec<(Ipv4Addr, Ipv4Addr, u32)>,
-    /// Preferred global/ULA IPv6 addresses: `(addr, ifindex)`.
-    pub v6: Vec<(Ipv6Addr, u32)>,
+    /// Preferred IPv4 addresses with netmask and ifindex.
+    pub v4: Vec<IfaceAddr4>,
+    /// Preferred global/ULA IPv6 addresses with ifindex.
+    pub v6: Vec<IfaceAddr6>,
     /// Configured extra interface-name prefixes to skip (mirrors `Config`).
     pub skip_interfaces: Vec<String>,
     /// Optional allowlist of interface-name prefixes (mirrors `Config`).
@@ -51,15 +64,6 @@ const MDNS_GROUP_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
 const BIND_RETRY: Duration = Duration::from_secs(3);
 const RECV_TIMEOUT: Duration = Duration::from_millis(200);
 const HEADER_QR_AA: u16 = 0x8400;
-const CMSG_BUF: usize = 256;
-
-/// One received UDP datagram with optional receiving-interface index.
-struct RecvPacket {
-    len: usize,
-    peer: SocketAddr,
-    ifindex: Option<u32>,
-    buf: [u8; 2048],
-}
 
 /// Parsed A/AAAA/ANY query (first question only).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,7 +154,7 @@ fn run_loop(state: Arc<RwLock<AnswerSet>>, port: u16, stop: Arc<AtomicBool>) -> 
         let mut got_any = false;
 
         if let Some(sock) = sock_v4.as_ref() {
-            match recv_with_pktinfo(sock, false) {
+            match sys::recv_with_pktinfo(sock, false) {
                 Ok(Some(pkt)) => {
                     got_any = true;
                     handle_packet(sock, &pkt.buf[..pkt.len], pkt.peer, pkt.ifindex, &state);
@@ -165,7 +169,7 @@ fn run_loop(state: Arc<RwLock<AnswerSet>>, port: u16, stop: Arc<AtomicBool>) -> 
             }
         }
         if let Some(sock) = sock_v6.as_ref() {
-            match recv_with_pktinfo(sock, true) {
+            match sys::recv_with_pktinfo(sock, true) {
                 Ok(Some(pkt)) => {
                     got_any = true;
                     handle_packet(sock, &pkt.buf[..pkt.len], pkt.peer, pkt.ifindex, &state);
@@ -220,7 +224,7 @@ fn bind_v4(port: u16, test_mode: bool) -> Result<Socket> {
         }
     }
     sock.set_read_timeout(Some(RECV_TIMEOUT))?;
-    enable_pktinfo_v4(&sock)?;
+    sys::enable_pktinfo_v4(&sock).map_err(Error::Io)?;
     let addr = if test_mode {
         SocketAddr::from((Ipv4Addr::LOCALHOST, port))
     } else {
@@ -241,7 +245,7 @@ fn bind_v6(port: u16, test_mode: bool) -> Result<Socket> {
     }
     sock.set_only_v6(true)?;
     sock.set_read_timeout(Some(RECV_TIMEOUT))?;
-    enable_pktinfo_v6(&sock)?;
+    sys::enable_pktinfo_v6(&sock).map_err(Error::Io)?;
     let addr = if test_mode {
         SocketAddr::from((Ipv6Addr::LOCALHOST, port))
     } else {
@@ -249,119 +253,6 @@ fn bind_v6(port: u16, test_mode: bool) -> Result<Socket> {
     };
     sock.bind(&addr.into())?;
     Ok(sock)
-}
-
-fn enable_pktinfo_v4(sock: &Socket) -> Result<()> {
-    let on: libc::c_int = 1;
-    // SAFETY: valid UDP socket; IP_PKTINFO is an int sockopt.
-    let rc = unsafe {
-        libc::setsockopt(
-            sock.as_raw_fd(),
-            libc::IPPROTO_IP,
-            libc::IP_PKTINFO,
-            &on as *const _ as *const libc::c_void,
-            mem::size_of_val(&on) as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        return Err(Error::Io(std::io::Error::last_os_error()));
-    }
-    Ok(())
-}
-
-fn enable_pktinfo_v6(sock: &Socket) -> Result<()> {
-    let on: libc::c_int = 1;
-    // SAFETY: valid UDP socket; IPV6_RECVPKTINFO is an int sockopt.
-    let rc = unsafe {
-        libc::setsockopt(
-            sock.as_raw_fd(),
-            libc::IPPROTO_IPV6,
-            libc::IPV6_RECVPKTINFO,
-            &on as *const _ as *const libc::c_void,
-            mem::size_of_val(&on) as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        return Err(Error::Io(std::io::Error::last_os_error()));
-    }
-    Ok(())
-}
-
-/// Receive one datagram and extract optional receiving ifindex from pktinfo.
-fn recv_with_pktinfo(sock: &Socket, is_v6: bool) -> std::io::Result<Option<RecvPacket>> {
-    let mut buf = [0u8; 2048];
-    let mut control = [MaybeUninit::<u8>::uninit(); CMSG_BUF];
-    let mut storage = SockAddrStorage::zeroed();
-    let mut addr_len = storage.size_of();
-
-    let mut iov = [IoSliceMut::new(&mut buf)];
-    // SAFETY: recvmsg with valid fd, iovec, control buffer, and sockaddr storage.
-    let (n, ifindex) = unsafe {
-        let mut msg: libc::msghdr = mem::zeroed();
-        msg.msg_name = storage.view_as::<libc::sockaddr_storage>() as *mut _ as *mut libc::c_void;
-        msg.msg_namelen = addr_len;
-        msg.msg_iov = iov.as_mut_ptr() as *mut libc::iovec;
-        msg.msg_iovlen = 1;
-        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = control.len();
-        let n = libc::recvmsg(sock.as_raw_fd(), &mut msg, 0);
-        if n < 0 {
-            (n, None)
-        } else {
-            addr_len = msg.msg_namelen;
-            let ifindex = parse_pktinfo_ifindex(&msg, is_v6);
-            (n, ifindex)
-        }
-    };
-    if n < 0 {
-        let err = std::io::Error::last_os_error();
-        if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) {
-            return Ok(None);
-        }
-        return Err(err);
-    }
-    if n == 0 {
-        return Ok(None);
-    }
-    // SAFETY: storage was filled by recvmsg with length `addr_len`.
-    let addr = unsafe { SockAddr::new(storage, addr_len) };
-    let peer = addr.as_socket().ok_or_else(|| {
-        std::io::Error::new(ErrorKind::InvalidData, "recvmsg returned non-IP address")
-    })?;
-    Ok(Some(RecvPacket {
-        len: n as usize,
-        peer,
-        ifindex,
-        buf,
-    }))
-}
-
-/// Extract ifindex from IP_PKTINFO / IPV6_PKTINFO control messages.
-///
-/// # Safety
-/// `msg` must be a valid `msghdr` after a successful `recvmsg`.
-unsafe fn parse_pktinfo_ifindex(msg: &libc::msghdr, is_v6: bool) -> Option<u32> {
-    if msg.msg_control.is_null() || msg.msg_controllen == 0 {
-        return None;
-    }
-    let mut cmsg = libc::CMSG_FIRSTHDR(msg);
-    while !cmsg.is_null() {
-        let hdr = &*cmsg;
-        if !is_v6 && hdr.cmsg_level == libc::IPPROTO_IP && hdr.cmsg_type == libc::IP_PKTINFO {
-            let ptr = libc::CMSG_DATA(cmsg) as *const libc::in_pktinfo;
-            if !ptr.is_null() {
-                return Some((*ptr).ipi_ifindex as u32);
-            }
-        }
-        if is_v6 && hdr.cmsg_level == libc::IPPROTO_IPV6 && hdr.cmsg_type == libc::IPV6_PKTINFO {
-            let ptr = libc::CMSG_DATA(cmsg) as *const libc::in6_pktinfo;
-            if !ptr.is_null() {
-                return Some((*ptr).ipi6_ifindex);
-            }
-        }
-        cmsg = libc::CMSG_NXTHDR(msg, cmsg);
-    }
-    None
 }
 
 fn refresh_memberships(
@@ -377,7 +268,7 @@ fn refresh_memberships(
         .read()
         .map(|g| {
             (
-                g.v4.iter().map(|(ip, _, _)| *ip).collect(),
+                g.v4.iter().map(|a| a.addr).collect(),
                 g.interfaces.clone(),
                 g.skip_interfaces.clone(),
             )
@@ -392,11 +283,11 @@ fn refresh_memberships(
     if let Some(sock) = sock_v4 {
         if *joined_v4 != want_v4 {
             for ip in joined_v4.iter() {
-                let _ = leave_multicast_v4(sock, *ip);
+                let _ = sock.leave_multicast_v4(&MDNS_GROUP_V4, ip);
             }
             joined_v4.clear();
             for ip in &want_v4 {
-                match join_multicast_v4(sock, *ip) {
+                match sock.join_multicast_v4(&MDNS_GROUP_V4, ip) {
                     Ok(()) => joined_v4.push(*ip),
                     Err(e) => log::debug!("join multicast v4 on {ip}: {e}"),
                 }
@@ -407,33 +298,17 @@ fn refresh_memberships(
     if let Some(sock) = sock_v6 {
         if *joined_ifindexes != want_idx {
             for idx in joined_ifindexes.iter() {
-                let _ = leave_multicast_v6(sock, *idx);
+                let _ = sock.leave_multicast_v6(&MDNS_GROUP_V6, *idx);
             }
             joined_ifindexes.clear();
             for idx in &want_idx {
-                match join_multicast_v6(sock, *idx) {
+                match sock.join_multicast_v6(&MDNS_GROUP_V6, *idx) {
                     Ok(()) => joined_ifindexes.push(*idx),
                     Err(e) => log::debug!("join multicast v6 ifindex {idx}: {e}"),
                 }
             }
         }
     }
-}
-
-fn join_multicast_v4(sock: &Socket, iface_ip: Ipv4Addr) -> std::io::Result<()> {
-    sock.join_multicast_v4(&MDNS_GROUP_V4, &iface_ip)
-}
-
-fn leave_multicast_v4(sock: &Socket, iface_ip: Ipv4Addr) -> std::io::Result<()> {
-    sock.leave_multicast_v4(&MDNS_GROUP_V4, &iface_ip)
-}
-
-fn join_multicast_v6(sock: &Socket, ifindex: u32) -> std::io::Result<()> {
-    sock.join_multicast_v6(&MDNS_GROUP_V6, ifindex)
-}
-
-fn leave_multicast_v6(sock: &Socket, ifindex: u32) -> std::io::Result<()> {
-    sock.leave_multicast_v6(&MDNS_GROUP_V6, ifindex)
 }
 
 /// Parse a DNS query packet; returns [`None`] when the packet is not an
@@ -542,68 +417,81 @@ pub fn build_response(
 
 /// Prefer addresses on the receiving ifindex; within those, same-subnet;
 /// otherwise fall back to same-subnet globally, then all.
+///
+/// Builds a single result `Vec` with at most two linear scans — no intermediate
+/// collections.
 #[must_use]
 pub fn choose_v4_for_iface(
     answers: &AnswerSet,
     querier: Ipv4Addr,
     ifindex: Option<u32>,
 ) -> Vec<Ipv4Addr> {
-    let on_iface: Vec<(Ipv4Addr, Ipv4Addr)> = if let Some(idx) = ifindex {
-        answers
-            .v4
-            .iter()
-            .filter(|(_, _, i)| *i == idx)
-            .map(|(a, m, _)| (*a, *m))
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    if !on_iface.is_empty() {
-        let same: Vec<Ipv4Addr> = on_iface
-            .iter()
-            .filter(|(addr, mask)| same_subnet(*addr, *mask, querier))
-            .map(|(addr, _)| *addr)
-            .collect();
-        if !same.is_empty() {
-            return same;
+    let mut out = Vec::new();
+    if let Some(idx) = ifindex {
+        let has_iface = answers.v4.iter().any(|a| a.ifindex == idx);
+        if has_iface {
+            for a in &answers.v4 {
+                if a.ifindex == idx && same_subnet(a.addr, a.mask, querier) {
+                    out.push(a.addr);
+                }
+            }
+            if !out.is_empty() {
+                return out;
+            }
+            for a in &answers.v4 {
+                if a.ifindex == idx {
+                    out.push(a.addr);
+                }
+            }
+            return out;
         }
-        return on_iface.into_iter().map(|(a, _)| a).collect();
     }
-
-    choose_v4(answers, querier)
+    choose_v4_into(answers, querier, &mut out);
+    out
 }
 
 /// Prefer IPv6 addresses on the receiving ifindex; otherwise all configured v6.
+///
+/// Single scan into the result — no intermediate collections.
 #[must_use]
 pub fn choose_v6_for_iface(answers: &AnswerSet, ifindex: Option<u32>) -> Vec<Ipv6Addr> {
+    let mut out = Vec::new();
     if let Some(idx) = ifindex {
-        let on_iface: Vec<Ipv6Addr> = answers
-            .v6
-            .iter()
-            .filter(|(_, i)| *i == idx)
-            .map(|(a, _)| *a)
-            .collect();
-        if !on_iface.is_empty() {
-            return on_iface;
+        for a in &answers.v6 {
+            if a.ifindex == idx {
+                out.push(a.addr);
+            }
+        }
+        if !out.is_empty() {
+            return out;
         }
     }
-    answers.v6.iter().map(|(a, _)| *a).collect()
+    for a in &answers.v6 {
+        out.push(a.addr);
+    }
+    out
 }
 
 /// Prefer same-subnet IPv4 addresses; otherwise all configured v4.
 #[must_use]
 pub fn choose_v4(answers: &AnswerSet, querier: Ipv4Addr) -> Vec<Ipv4Addr> {
-    let same: Vec<Ipv4Addr> = answers
-        .v4
-        .iter()
-        .filter(|(addr, mask, _)| same_subnet(*addr, *mask, querier))
-        .map(|(addr, _, _)| *addr)
-        .collect();
-    if !same.is_empty() {
-        same
-    } else {
-        answers.v4.iter().map(|(addr, _, _)| *addr).collect()
+    let mut out = Vec::new();
+    choose_v4_into(answers, querier, &mut out);
+    out
+}
+
+fn choose_v4_into(answers: &AnswerSet, querier: Ipv4Addr, out: &mut Vec<Ipv4Addr>) {
+    debug_assert!(out.is_empty());
+    for a in &answers.v4 {
+        if same_subnet(a.addr, a.mask, querier) {
+            out.push(a.addr);
+        }
+    }
+    if !out.is_empty() {
+        return;
+    }
+    for a in &answers.v4 {
+        out.push(a.addr);
     }
 }
 
