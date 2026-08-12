@@ -84,8 +84,7 @@ impl MdnsPublisher {
                 .map_err(|e| Error::Mdns(e.to_string()))?
                 .enable_addr_auto()
         } else {
-            let mut ip_strs: Vec<String> =
-                v6.iter().map(|a| a.addr.to_string()).collect();
+            let mut ip_strs: Vec<String> = v6.iter().map(|a| a.addr.to_string()).collect();
             ip_strs.extend(v4.iter().map(|ip| ip.to_string()));
             let joined = ip_strs.join(",");
             ServiceInfo::new(&ty, &entry.name, &host, joined.as_str(), entry.port, props)

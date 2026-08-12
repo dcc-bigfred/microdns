@@ -182,10 +182,11 @@ pub fn run(config_path: &Path) -> Result<()> {
         }
 
         let ips = mdns::preferred_ipv4_addrs(&cfg.interfaces, &cfg.skip_interfaces);
-        let ips_v6: Vec<Ipv6Addr> = mdns::preferred_ipv6_addrs(&cfg.interfaces, &cfg.skip_interfaces)
-            .into_iter()
-            .map(|a| a.addr)
-            .collect();
+        let ips_v6: Vec<Ipv6Addr> =
+            mdns::preferred_ipv6_addrs(&cfg.interfaces, &cfg.skip_interfaces)
+                .into_iter()
+                .map(|a| a.addr)
+                .collect();
         if ips.is_empty() {
             let why = if !cfg.interfaces.is_empty() {
                 format!(
