@@ -137,6 +137,13 @@ pub struct Config {
     /// where `wireless-programmer` owns the radio) add `["wlan"]` here.
     #[serde(default)]
     pub skip_interfaces: Vec<String>,
+    /// Optional allowlist of interface name prefixes (case-insensitive).
+    /// Empty (default) means advertise on every usable interface that is not
+    /// skipped. When non-empty, only matching interfaces are used; a listed
+    /// interface that is temporarily missing logs a warning and is retried —
+    /// it does not crash the daemon.
+    #[serde(default)]
+    pub interfaces: Vec<String>,
 }
 
 impl Default for Config {
@@ -153,6 +160,7 @@ impl Default for Config {
             dcc_bus: DccBusConfig::default(),
             retry: RetryConfig::default(),
             skip_interfaces: Vec::new(),
+            interfaces: Vec::new(),
         }
     }
 }
@@ -189,8 +197,27 @@ impl Config {
                 ));
             }
         }
+        validate_iface_prefixes("skipInterfaces", &self.skip_interfaces)?;
+        validate_iface_prefixes("interfaces", &self.interfaces)?;
         Ok(())
     }
+}
+
+fn validate_iface_prefixes(field: &str, entries: &[String]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            return Err(Error::Config(format!("{field}: entries must not be empty")));
+        }
+        let key = trimmed.to_ascii_lowercase();
+        if !seen.insert(key) {
+            return Err(Error::Config(format!(
+                "{field}: duplicate prefix '{trimmed}'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Accept `_name._tcp` / `_name._udp`, optionally with a `.local` suffix.

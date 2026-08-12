@@ -46,11 +46,16 @@ impl MdnsPublisher {
         }
     }
 
-    /// Register (or re-register) a service. Uses auto addresses when available.
+    /// Register (or re-register) a service.
+    ///
+    /// Host A/AAAA records are intentionally omitted: the legacy unicast /
+    /// multicast responder owns per-interface hostname answers. mdns-sd only
+    /// publishes PTR/SRV/TXT here.
     pub fn register(
         &self,
         entry: &ServiceEntry,
         host_override: Option<&str>,
+        allow: &[String],
         skip: &[String],
     ) -> Result<()> {
         let daemon = self
@@ -65,20 +70,12 @@ impl MdnsPublisher {
                 .unwrap_or(&version::hostname()),
         );
         let props = entry.txt.clone().unwrap_or_default();
-        let ips = preferred_ipv4_addrs(skip);
-
-        let info = if ips.is_empty() {
-            // No usable interface yet — register with addr_auto so mdns-sd
-            // fills addresses when interfaces appear.
-            ServiceInfo::new(&ty, &entry.name, &host, "", entry.port, props.clone())
-                .map_err(|e| Error::Mdns(e.to_string()))?
-                .enable_addr_auto()
-        } else {
-            let ip_strs: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
-            let joined = ip_strs.join(",");
-            ServiceInfo::new(&ty, &entry.name, &host, joined.as_str(), entry.port, props)
-                .map_err(|e| Error::Mdns(e.to_string()))?
-        };
+        // Empty addresses → no host A/AAAA from mdns-sd. Our responder answers
+        // A/AAAA per receiving interface via IP_PKTINFO. Selection of which
+        // interfaces to listen on uses `allow`/`skip` in AnswerSet / preferred_*.
+        let _ = (allow, skip);
+        let info = ServiceInfo::new(&ty, &entry.name, &host, "", entry.port, props)
+            .map_err(|e| Error::Mdns(e.to_string()))?;
 
         let fullname = info.get_fullname().to_string();
         daemon
@@ -175,57 +172,51 @@ pub fn normalize_hostname(host: &str) -> String {
     format!("{bare}.local.")
 }
 
-/// Collect preferred IPv4 addresses: UP, non-loopback, not docker/veth/br-*.
+/// Collect preferred IPv4 addresses: UP, non-loopback, allowlisted, not skipped.
 #[must_use]
-pub fn preferred_ipv4_addrs(skip: &[String]) -> Vec<Ipv4Addr> {
-    preferred_ipv4_ifaces(skip)
+pub fn preferred_ipv4_addrs(allow: &[String], skip: &[String]) -> Vec<Ipv4Addr> {
+    preferred_ipv4_ifaces(allow, skip)
         .into_iter()
-        .map(|(ip, _mask)| ip)
+        .map(|(ip, _mask, _ifindex)| ip)
         .collect()
 }
 
-/// Preferred IPv4 addresses with netmasks (for same-subnet reply selection).
+/// Preferred IPv4 addresses with netmasks and ifindex (for per-iface replies).
 #[must_use]
-pub fn preferred_ipv4_ifaces(skip: &[String]) -> Vec<(Ipv4Addr, Ipv4Addr)> {
+pub fn preferred_ipv4_ifaces(allow: &[String], skip: &[String]) -> Vec<(Ipv4Addr, Ipv4Addr, u32)> {
     let mut addrs = Vec::new();
     let Ok(ifaces) = list_interfaces() else {
         return addrs;
     };
     for iface in ifaces {
-        if should_skip_iface(&iface.name, skip) {
-            continue;
-        }
-        if !iface.is_up || iface.is_loopback {
+        if !iface_usable(&iface, allow, skip) {
             continue;
         }
         for (ip, mask) in iface.ipv4 {
             if !ip.is_loopback() && !ip.is_unspecified() {
-                addrs.push((ip, mask));
+                addrs.push((ip, mask, iface.ifindex));
             }
         }
     }
     addrs
 }
 
-/// Preferred global/ULA IPv6 addresses (no loopback, unspecified, or link-local).
+/// Preferred global/ULA IPv6 addresses with ifindex (no loopback/unspecified/link-local).
 #[must_use]
-pub fn preferred_ipv6_addrs(skip: &[String]) -> Vec<Ipv6Addr> {
+pub fn preferred_ipv6_addrs(allow: &[String], skip: &[String]) -> Vec<(Ipv6Addr, u32)> {
     let mut addrs = Vec::new();
     let Ok(ifaces) = list_interfaces() else {
         return addrs;
     };
     for iface in ifaces {
-        if should_skip_iface(&iface.name, skip) {
-            continue;
-        }
-        if !iface.is_up || iface.is_loopback {
+        if !iface_usable(&iface, allow, skip) {
             continue;
         }
         for ip in iface.ipv6 {
             if ip.is_loopback() || ip.is_unspecified() || is_ipv6_link_local(&ip) {
                 continue;
             }
-            addrs.push(ip);
+            addrs.push((ip, iface.ifindex));
         }
     }
     addrs
@@ -233,16 +224,13 @@ pub fn preferred_ipv6_addrs(skip: &[String]) -> Vec<Ipv6Addr> {
 
 /// Interface index for multicast group joins (IPv6).
 #[must_use]
-pub fn preferred_iface_indexes(skip: &[String]) -> Vec<u32> {
+pub fn preferred_iface_indexes(allow: &[String], skip: &[String]) -> Vec<u32> {
     let mut out = Vec::new();
     let Ok(ifaces) = list_interfaces() else {
         return out;
     };
     for iface in ifaces {
-        if should_skip_iface(&iface.name, skip) {
-            continue;
-        }
-        if !iface.is_up || iface.is_loopback {
+        if !iface_usable(&iface, allow, skip) {
             continue;
         }
         if iface.ipv4.is_empty() && iface.ipv6.is_empty() {
@@ -255,9 +243,40 @@ pub fn preferred_iface_indexes(skip: &[String]) -> Vec<u32> {
     out
 }
 
+fn iface_usable(iface: &IfaceInfo, allow: &[String], skip: &[String]) -> bool {
+    if should_skip_iface(&iface.name, skip) {
+        return false;
+    }
+    if !is_allowed_iface(&iface.name, allow) {
+        return false;
+    }
+    if !iface.is_up || iface.is_loopback {
+        return false;
+    }
+    true
+}
+
 fn is_ipv6_link_local(ip: &Ipv6Addr) -> bool {
     let octets = ip.octets();
     octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80
+}
+
+/// Whether `name` is allowed by the optional allowlist.
+///
+/// Empty `allow` means every interface is allowed. Otherwise matching is by
+/// case-insensitive name **prefix**, same rules as [`should_skip_iface`].
+#[must_use]
+pub fn is_allowed_iface(name: &str, allow: &[String]) -> bool {
+    if allow.is_empty() {
+        return true;
+    }
+    let n = name.to_ascii_lowercase();
+    allow.iter().any(|p| {
+        let p = p.trim();
+        !p.is_empty()
+            && n.get(..p.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(p))
+    })
 }
 
 /// Whether to skip an interface by name.
@@ -414,14 +433,14 @@ pub fn dcc_service_entry(
 
 /// Check whether any preferred interface currently has an IPv4 address.
 #[must_use]
-pub fn has_usable_iface(skip: &[String]) -> bool {
-    !preferred_ipv4_addrs(skip).is_empty()
+pub fn has_usable_iface(allow: &[String], skip: &[String]) -> bool {
+    !preferred_ipv4_addrs(allow, skip).is_empty()
 }
 
 /// Return first preferred IP as [`IpAddr`], if any.
 #[must_use]
-pub fn primary_ip(skip: &[String]) -> Option<IpAddr> {
-    preferred_ipv4_addrs(skip)
+pub fn primary_ip(allow: &[String], skip: &[String]) -> Option<IpAddr> {
+    preferred_ipv4_addrs(allow, skip)
         .into_iter()
         .next()
         .map(IpAddr::V4)

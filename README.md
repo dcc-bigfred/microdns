@@ -3,7 +3,9 @@
 Micro-daemon that advertises mDNS/DNS-SD services for BigFred OS.
 
 Quietly retries when interfaces, the microinit control socket, or dcc-bus are
-unavailable. Always starts successfully.
+unavailable. Always starts successfully. Survives network drop/return and
+interface add/remove via rtnetlink (with polling fallback). Resolves hostnames
+per receiving interface so a WiFi client gets the WiFi address.
 
 ## Features
 
@@ -55,7 +57,8 @@ Default path: `$DATA_DIR/etc/microdns.json`. Created with defaults if missing.
     "mdnsMs": 3000,
     "ifaceMs": 5000
   },
-  "skipInterfaces": []
+  "skipInterfaces": [],
+  "interfaces": []
 }
 ```
 
@@ -71,6 +74,15 @@ Default path: `$DATA_DIR/etc/microdns.json`. Created with defaults if missing.
   Entries are name **prefixes**, not globs or exact names: `"wlan"` covers
   `wlan0`/`wlan1` but not `wlp3s0`, and a short entry like `"e"` would take
   `eth0` and `enp1s0` with it, leaving nothing to advertise on.
+- `interfaces` (default `[]`): optional allowlist of interface-name prefixes
+  (same prefix rules as `skipInterfaces`). Empty means use every usable
+  interface that is not skipped. When set (e.g. `["eth","enp"]`), only
+  matching interfaces are used; a listed interface that disappears logs a
+  warning and is retried — it does not crash the daemon.
+- Hostname A/AAAA answers (`bigfred.local`) are selected **per receiving
+  interface** (via `IP_PKTINFO`): a client querying on WiFi gets the WiFi
+  address, not the Ethernet one. Interface add/remove/address changes are
+  detected via rtnetlink with polling fallback.
 
 ## Run
 

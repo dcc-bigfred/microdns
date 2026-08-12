@@ -7,8 +7,8 @@ use std::thread;
 use std::time::Duration;
 
 use microdns::legacy_unicast::{
-    build_response, choose_v4, hosts_match, parse_query, spawn, AnswerSet, ParsedQuery, LEGACY_TTL,
-    QTYPE_A, QTYPE_AAAA, QTYPE_ANY,
+    build_response, choose_v4, choose_v4_for_iface, choose_v6_for_iface, hosts_match, parse_query,
+    spawn, AnswerSet, ParsedQuery, LEGACY_TTL, QTYPE_A, QTYPE_AAAA, QTYPE_ANY,
 };
 
 fn encode_name(name: &str) -> Vec<u8> {
@@ -45,11 +45,17 @@ fn sample_answers() -> AnswerSet {
             (
                 Ipv4Addr::new(192, 168, 1, 10),
                 Ipv4Addr::new(255, 255, 255, 0),
+                2, // eth0
             ),
-            (Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(255, 0, 0, 0)),
+            (
+                Ipv4Addr::new(10, 0, 0, 5),
+                Ipv4Addr::new(255, 0, 0, 0),
+                3, // wlan0
+            ),
         ],
-        v6: vec![Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)],
+        v6: vec![(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 2)],
         skip_interfaces: Vec::new(),
+        interfaces: Vec::new(),
     }
 }
 
@@ -57,19 +63,21 @@ fn sample_answers() -> AnswerSet {
 fn parse_rejects_response_qr() {
     let mut pkt = build_query(1, "bigfred.local.", QTYPE_A, 1);
     pkt[2] = 0x80; // QR
-    assert!(parse_query(&pkt, 54321).is_none());
+    assert!(parse_query(&pkt).is_none());
 }
 
 #[test]
-fn parse_rejects_mdns_src_port() {
+fn parse_accepts_mdns_multicast_query() {
+    // Multicast queries (src port 5353) are answered; content selects per-iface IP.
     let pkt = build_query(1, "bigfred.local.", QTYPE_A, 1);
-    assert!(parse_query(&pkt, 5353).is_none());
+    let q = parse_query(&pkt).expect("parse");
+    assert_eq!(q.qtype, QTYPE_A);
 }
 
 #[test]
 fn parse_extracts_android_style_query() {
     let pkt = build_query(11110, "bigfred.local.", QTYPE_A, 1);
-    let q = parse_query(&pkt, 54321).expect("parse");
+    let q = parse_query(&pkt).expect("parse");
     assert_eq!(
         q,
         ParsedQuery {
@@ -84,13 +92,13 @@ fn parse_extracts_android_style_query() {
 #[test]
 fn parse_rejects_non_in_class() {
     let pkt = build_query(1, "bigfred.local.", QTYPE_A, 2);
-    assert!(parse_query(&pkt, 12345).is_none());
+    assert!(parse_query(&pkt).is_none());
 }
 
 #[test]
 fn parse_accepts_qu_bit_in_class() {
     let pkt = build_query(1, "bigfred.local.", QTYPE_A, 0x8001);
-    let q = parse_query(&pkt, 12345).expect("parse");
+    let q = parse_query(&pkt).expect("parse");
     assert_eq!(q.qclass, 0x8001);
 }
 
@@ -118,6 +126,41 @@ fn choose_v4_falls_back_to_all() {
 }
 
 #[test]
+fn choose_v4_for_iface_prefers_receiving_iface() {
+    let answers = sample_answers();
+    // Query from eth subnet but arrived on wlan (ifindex 3) → answer wlan IP.
+    let chosen = choose_v4_for_iface(&answers, Ipv4Addr::new(192, 168, 1, 50), Some(3));
+    assert_eq!(chosen, vec![Ipv4Addr::new(10, 0, 0, 5)]);
+}
+
+#[test]
+fn choose_v4_for_iface_same_subnet_within_iface() {
+    let mut answers = sample_answers();
+    answers
+        .v4
+        .push((Ipv4Addr::new(10, 1, 0, 5), Ipv4Addr::new(255, 255, 0, 0), 3));
+    let chosen = choose_v4_for_iface(&answers, Ipv4Addr::new(10, 0, 0, 99), Some(3));
+    assert_eq!(chosen, vec![Ipv4Addr::new(10, 0, 0, 5)]);
+}
+
+#[test]
+fn choose_v4_for_iface_falls_back_without_ifindex() {
+    let answers = sample_answers();
+    let chosen = choose_v4_for_iface(&answers, Ipv4Addr::new(192, 168, 1, 50), None);
+    assert_eq!(chosen, vec![Ipv4Addr::new(192, 168, 1, 10)]);
+}
+
+#[test]
+fn choose_v6_for_iface_prefers_receiving_iface() {
+    let mut answers = sample_answers();
+    answers
+        .v6
+        .push((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2), 3));
+    let chosen = choose_v6_for_iface(&answers, Some(3));
+    assert_eq!(chosen, vec![Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)]);
+}
+
+#[test]
 fn build_echoes_id_and_ttl() {
     let answers = sample_answers();
     let query = ParsedQuery {
@@ -126,8 +169,13 @@ fn build_echoes_id_and_ttl() {
         qtype: QTYPE_A,
         qclass: 0x8001,
     };
-    let resp = build_response(&query, &answers, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)))
-        .expect("response");
+    let resp = build_response(
+        &query,
+        &answers,
+        IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+        Some(2),
+    )
+    .expect("response");
     assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), 0x2b76);
     assert_eq!(u16::from_be_bytes([resp[2], resp[3]]), 0x8400);
     assert_eq!(u16::from_be_bytes([resp[4], resp[5]]), 1); // qdcount
@@ -172,7 +220,7 @@ fn build_none_for_unknown_host() {
         qtype: QTYPE_A,
         qclass: 1,
     };
-    assert!(build_response(&query, &answers, IpAddr::V4(Ipv4Addr::LOCALHOST)).is_none());
+    assert!(build_response(&query, &answers, IpAddr::V4(Ipv4Addr::LOCALHOST), None).is_none());
 }
 
 #[test]
@@ -185,7 +233,7 @@ fn build_aaaa_none_when_empty() {
         qtype: QTYPE_AAAA,
         qclass: 1,
     };
-    assert!(build_response(&query, &answers, IpAddr::V4(Ipv4Addr::LOCALHOST)).is_none());
+    assert!(build_response(&query, &answers, IpAddr::V4(Ipv4Addr::LOCALHOST), None).is_none());
 }
 
 #[test]
@@ -197,8 +245,13 @@ fn build_any_includes_a_and_aaaa() {
         qtype: QTYPE_ANY,
         qclass: 1,
     };
-    let resp = build_response(&query, &answers, IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)))
-        .expect("response");
+    let resp = build_response(
+        &query,
+        &answers,
+        IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
+        None,
+    )
+    .expect("response");
     assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 3); // 2 A + 1 AAAA
 }
 
@@ -226,9 +279,10 @@ fn spawn_echoes_transaction_id_on_ephemeral_port() {
 
         let answers = Arc::new(RwLock::new(AnswerSet {
             hosts: vec!["bigfred.local.".into()],
-            v4: vec![(Ipv4Addr::new(127, 0, 0, 1), Ipv4Addr::new(255, 0, 0, 0))],
+            v4: vec![(Ipv4Addr::new(127, 0, 0, 1), Ipv4Addr::new(255, 0, 0, 0), 1)],
             v6: Vec::new(),
             skip_interfaces: Vec::new(),
+            interfaces: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         if spawn(Arc::clone(&answers), port, Arc::clone(&stop)).is_err() {

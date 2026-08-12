@@ -1,5 +1,6 @@
 use microdns::mdns::{
-    dcc_service_entry, normalize_hostname, normalize_service_type, should_skip_iface,
+    dcc_service_entry, is_allowed_iface, normalize_hostname, normalize_service_type,
+    should_skip_iface,
 };
 
 #[test]
@@ -43,6 +44,20 @@ fn skip_virtual_ifaces() {
     assert!(!should_skip_iface("wlan0", &["".into()]));
     assert!(!should_skip_iface("eth0", &["wlan".into()]));
     assert!(!should_skip_iface("wlp3s0", &["wlan".into()]));
+}
+
+#[test]
+fn allowlist_empty_means_all() {
+    assert!(is_allowed_iface("eth0", &[]));
+    assert!(is_allowed_iface("wlan0", &[]));
+}
+
+#[test]
+fn allowlist_prefix_match() {
+    assert!(is_allowed_iface("eth0", &["eth".into()]));
+    assert!(is_allowed_iface("ETH0", &["eth".into()]));
+    assert!(!is_allowed_iface("wlan0", &["eth".into()]));
+    assert!(!is_allowed_iface("eth0", &["".into()]));
 }
 
 #[test]
