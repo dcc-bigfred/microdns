@@ -49,9 +49,11 @@ impl MdnsPublisher {
 
     /// Register (or re-register) a service.
     ///
-    /// Host A/AAAA records are intentionally omitted: the legacy unicast /
-    /// multicast responder owns per-interface hostname answers. mdns-sd only
-    /// publishes PTR/SRV/TXT here.
+    /// Host A/AAAA records are published by mdns-sd via multicast so that local
+    /// resolvers (e.g. avahi-daemon backing nss-mdns) cache them and the host
+    /// can resolve its own `.local` names. The legacy unicast responder still
+    /// answers A/AAAA for direct (non-5353) legacy queries, but mdns-sd owns
+    /// the multicast A/AAAA announcements.
     pub fn register(
         &self,
         entry: &ServiceEntry,
@@ -71,12 +73,24 @@ impl MdnsPublisher {
                 .unwrap_or(&version::hostname()),
         );
         let props = entry.txt.clone().unwrap_or_default();
-        // Empty addresses → no host A/AAAA from mdns-sd. Our responder answers
-        // A/AAAA per receiving interface via IP_PKTINFO. Selection of which
-        // interfaces to listen on uses `allow`/`skip` in AnswerSet / preferred_*.
-        let _ = (allow, skip);
-        let info = ServiceInfo::new(&ty, &entry.name, &host, "", entry.port, props)
-            .map_err(|e| Error::Mdns(e.to_string()))?;
+
+        // Collect preferred IPv4 + IPv6 addresses (allow/skip filtered) so
+        // mdns-sd publishes A/AAAA on the wire. Empty → addr_auto lets mdns-sd
+        // fill from host interfaces when they appear later.
+        let v4 = preferred_ipv4_addrs(allow, skip);
+        let v6 = preferred_ipv6_addrs(allow, skip);
+        let info = if v4.is_empty() && v6.is_empty() {
+            ServiceInfo::new(&ty, &entry.name, &host, "", entry.port, props)
+                .map_err(|e| Error::Mdns(e.to_string()))?
+                .enable_addr_auto()
+        } else {
+            let mut ip_strs: Vec<String> =
+                v6.iter().map(|a| a.addr.to_string()).collect();
+            ip_strs.extend(v4.iter().map(|ip| ip.to_string()));
+            let joined = ip_strs.join(",");
+            ServiceInfo::new(&ty, &entry.name, &host, joined.as_str(), entry.port, props)
+                .map_err(|e| Error::Mdns(e.to_string()))?
+        };
 
         let fullname = info.get_fullname().to_string();
         daemon
