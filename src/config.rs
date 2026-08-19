@@ -73,21 +73,11 @@ pub struct ServiceEntry {
     pub txt: Option<HashMap<String, String>>,
 }
 
-/// Optional leftover dcc-bus JSON. Discovery ignores `enabled` and the
-/// guessed ports (those came from microinit + `/proc`). `beacon` still
-/// controls the Z21 LAN serial broadcast.
+/// Z21 LAN serial broadcast when a `_z21._udp` port is advertised.
+/// Extra keys in existing JSON (`enabled`, port guesses) are ignored.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DccBusConfig {
-    /// Ignored for discovery (kept so existing JSON still parses).
-    #[serde(default)]
-    pub enabled: bool,
-    /// Ignored for discovery.
-    #[serde(default = "default_z21_port")]
-    pub z21_port: u16,
-    /// Ignored for discovery.
-    #[serde(default = "default_withrottle_port")]
-    pub withrottle_port: u16,
     /// Broadcast LAN_GET_SERIAL_NUMBER reply when a Z21 port is advertised.
     #[serde(default = "default_true")]
     pub beacon: bool,
@@ -95,21 +85,8 @@ pub struct DccBusConfig {
 
 impl Default for DccBusConfig {
     fn default() -> Self {
-        Self {
-            enabled: false,
-            z21_port: default_z21_port(),
-            withrottle_port: default_withrottle_port(),
-            beacon: true,
-        }
+        Self { beacon: true }
     }
-}
-
-fn default_z21_port() -> u16 {
-    21105
-}
-
-fn default_withrottle_port() -> u16 {
-    12090
 }
 
 fn default_true() -> bool {
@@ -121,11 +98,9 @@ fn default_true() -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct RetryConfig {
     /// Poll interval while the BigFred socket is answering (milliseconds).
-    #[serde(default = "default_microinit_ms")]
-    pub microinit_ms: u64,
-    /// Unused; kept so existing JSON still parses.
-    #[serde(default = "default_proc_ms")]
-    pub proc_ms: u64,
+    /// `microinitMs` is accepted as an alias for existing JSON files.
+    #[serde(default = "default_poll_ms", alias = "microinitMs")]
+    pub poll_ms: u64,
     #[serde(default = "default_mdns_ms")]
     pub mdns_ms: u64,
     #[serde(default = "default_iface_ms")]
@@ -138,8 +113,7 @@ pub struct RetryConfig {
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            microinit_ms: default_microinit_ms(),
-            proc_ms: default_proc_ms(),
+            poll_ms: default_poll_ms(),
             mdns_ms: default_mdns_ms(),
             iface_ms: default_iface_ms(),
             bigfred_ms: default_bigfred_ms(),
@@ -147,10 +121,7 @@ impl Default for RetryConfig {
     }
 }
 
-fn default_microinit_ms() -> u64 {
-    2000
-}
-fn default_proc_ms() -> u64 {
+fn default_poll_ms() -> u64 {
     2000
 }
 fn default_mdns_ms() -> u64 {

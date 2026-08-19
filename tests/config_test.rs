@@ -14,11 +14,21 @@ fn tmp_path(name: &str) -> PathBuf {
 
 #[test]
 fn bigfred_enabled_defaults_true_when_key_absent() {
-    let json = r#"{"services":[],"dccBus":{"enabled":true}}"#;
+    let json = r#"{"services":[],"dccBus":{"enabled":true,"z21Port":21105}}"#;
     let cfg: Config = serde_json::from_str(json).unwrap();
     assert!(cfg.bigfred.enabled);
-    assert!(cfg.dcc_bus.enabled);
+    assert!(cfg.dcc_bus.beacon);
     assert_eq!(cfg.retry.bigfred_ms, 45_000);
+}
+
+#[test]
+fn leftover_retry_keys_are_ignored_or_aliased() {
+    let json = r#"{
+            "services": [],
+            "retry": { "microinitMs": 1500, "procMs": 9999 }
+        }"#;
+    let cfg: Config = serde_json::from_str(json).unwrap();
+    assert_eq!(cfg.retry.poll_ms, 1500);
 }
 
 #[test]
@@ -27,11 +37,14 @@ fn default_roundtrip() {
     let json = serde_json::to_string_pretty(&cfg).unwrap();
     let back: Config = serde_json::from_str(&json).unwrap();
     assert_eq!(cfg, back);
-    assert!(!back.dcc_bus.enabled);
+    assert!(back.dcc_bus.beacon);
     assert!(back.bigfred.enabled);
-    assert_eq!(back.dcc_bus.z21_port, 21105);
+    assert_eq!(back.retry.poll_ms, 2000);
     assert_eq!(back.retry.mdns_ms, 3000);
     assert_eq!(back.retry.bigfred_ms, 45_000);
+    assert!(!json.contains("microinitMs"));
+    assert!(!json.contains("procMs"));
+    assert!(!json.contains("z21Port"));
 }
 
 #[test]

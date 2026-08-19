@@ -77,7 +77,7 @@ pub struct BeaconWant {
     pub serial: u32,
 }
 
-/// Desired advertisement set derived from config + empirical dcc-bus state.
+/// Desired advertisement set derived from config + loco-server `dcc_bus_list`.
 ///
 /// `ips` (IPv4) and `ips_v6` (IPv6) are both included so DHCP / SLAAC privacy
 /// address churn triggers re-registration of A/AAAA via mdns-sd.
@@ -290,7 +290,7 @@ pub fn run(config_path: &Path) -> Result<()> {
                         last_programs = Some(programs);
                         bigfred_thr.ok("bigfred socket");
                         next_bigfred_probe =
-                            Instant::now() + Duration::from_millis(retry.microinit_ms.max(500));
+                            Instant::now() + Duration::from_millis(retry.poll_ms.max(500));
                     }
                     Err(e) => {
                         last_programs = None;
