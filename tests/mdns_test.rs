@@ -78,10 +78,20 @@ fn link_ready_requires_running_or_operstate_up() {
 
 #[test]
 fn dcc_entry_has_proto_txt() {
-    let e = dcc_service_entry("hub1", "_z21._udp", "udp", 21105, 2, 5, Some(258_002_005));
+    let e = dcc_service_entry(
+        "hub1",
+        "_z21._udp",
+        "udp",
+        21105,
+        2,
+        5,
+        "Klubowa",
+        Some(258_002_005),
+    );
     let txt = e.txt.as_ref().unwrap();
     assert_eq!(txt.get("proto").unwrap(), "udp");
     assert_eq!(txt.get("layoutId").unwrap(), "2");
     assert_eq!(txt.get("commandStationId").unwrap(), "5");
+    assert_eq!(txt.get("layoutName").unwrap(), "Klubowa");
     assert_eq!(txt.get("serial").unwrap(), "258002005");
 }

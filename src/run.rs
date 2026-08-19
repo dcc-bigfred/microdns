@@ -9,14 +9,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::beacon::{self, virtual_serial};
+use crate::bigfred_watch::{self, Program};
 use crate::config::{self, Config, ServiceEntry};
 use crate::config_watch::{self, ReloadSignal};
 use crate::error::Result;
 use crate::iface_watch::{self, IfaceChange};
 use crate::legacy_unicast::{self, AnswerSet, MembershipRefresh};
 use crate::mdns::{self, MdnsPublisher};
-use crate::microinit_watch;
-use crate::proc_scan::{self, ListenPorts};
 use crate::signals;
 use crate::sys;
 use crate::version;
@@ -153,8 +152,9 @@ pub fn run(config_path: &Path) -> Result<()> {
     // Main orchestration: iface/mdns + optional dcc-bus.
     let mut iface_thr = FailThrottle::new();
     let mut mdns_thr = FailThrottle::new();
-    let mut microinit_thr = FailThrottle::new();
-    let mut proc_thr = FailThrottle::new();
+    let mut bigfred_thr = FailThrottle::new();
+    let mut last_programs: Option<Vec<Program>> = None;
+    let mut next_bigfred_probe = Instant::now();
 
     let mut last_desired = DesiredAds {
         static_services: Vec::new(),
@@ -278,61 +278,41 @@ pub fn run(config_path: &Path) -> Result<()> {
             skip_interfaces,
             interfaces,
         };
-        let dcc_enabled = cfg.dcc_bus.enabled;
-        let z21_port = cfg.dcc_bus.z21_port;
-        let withrottle_port = cfg.dcc_bus.withrottle_port;
+        let bigfred_enabled = cfg.bigfred.enabled;
+        let bigfred_socket = cfg.bigfred.socket_path();
         let beacon = cfg.dcc_bus.beacon;
         let retry = cfg.retry;
 
-        if dcc_enabled {
-            let sock = config::default_microinit_socket();
-            match microinit_watch::list_dcc_bus_services(&sock) {
-                Ok(services) => {
-                    let running: Vec<_> = services
-                        .iter()
-                        .filter(|s| microinit_watch::is_running(s))
-                        .collect();
-                    if running.is_empty() {
-                        microinit_thr.fail("microinit dcc-bus", &"no running dcc-bus-* service");
-                    } else {
-                        microinit_thr.ok("microinit dcc-bus");
-                        let mut any_scan_ok = false;
-                        for st in &running {
-                            let Some(pid) = st.pid else {
-                                continue;
-                            };
-                            match proc_scan::listen_ports_for_pid(pid) {
-                                Ok(ports) => {
-                                    any_scan_ok = true;
-                                    append_station_ads(
-                                        &mut desired,
-                                        &st.name,
-                                        &ports,
-                                        z21_port,
-                                        withrottle_port,
-                                        beacon,
-                                    );
-                                }
-                                Err(e) => proc_thr.fail("proc listen scan", &e),
-                            }
-                        }
-                        if any_scan_ok {
-                            proc_thr.ok("proc listen scan");
-                        }
-                        desired.dynamic.sort_by(|a, b| {
-                            (&a.entry.name, &a.entry.type_, a.entry.port).cmp(&(
-                                &b.entry.name,
-                                &b.entry.type_,
-                                b.entry.port,
-                            ))
-                        });
-                        desired.beacons.sort_unstable();
-                        desired.beacons.dedup();
+        if bigfred_enabled {
+            if Instant::now() >= next_bigfred_probe {
+                match bigfred_watch::dcc_bus_list(&bigfred_socket) {
+                    Ok(programs) => {
+                        last_programs = Some(programs);
+                        bigfred_thr.ok("bigfred socket");
+                        next_bigfred_probe =
+                            Instant::now() + Duration::from_millis(retry.microinit_ms.max(500));
+                    }
+                    Err(e) => {
+                        last_programs = None;
+                        bigfred_thr.fail("bigfred socket", &e);
+                        next_bigfred_probe =
+                            Instant::now() + Duration::from_millis(retry.bigfred_ms.max(500));
                     }
                 }
-                Err(e) => {
-                    microinit_thr.fail("microinit socket", &e);
+            }
+            if let Some(programs) = &last_programs {
+                for p in programs {
+                    append_station_ads(&mut desired, p, beacon);
                 }
+                desired.dynamic.sort_by(|a, b| {
+                    (&a.entry.name, &a.entry.type_, a.entry.port).cmp(&(
+                        &b.entry.name,
+                        &b.entry.type_,
+                        b.entry.port,
+                    ))
+                });
+                desired.beacons.sort_unstable();
+                desired.beacons.dedup();
             }
         }
 
@@ -355,8 +335,11 @@ pub fn run(config_path: &Path) -> Result<()> {
         }
 
         // Sleep until next poll; wake early on shutdown, netlink, or suspend.
-        let sleep_ms = if dcc_enabled {
-            retry.proc_ms.min(retry.microinit_ms).min(retry.iface_ms)
+        let sleep_ms = if bigfred_enabled {
+            let until_probe = next_bigfred_probe
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64;
+            until_probe.min(retry.iface_ms)
         } else {
             retry.iface_ms.min(retry.mdns_ms)
         };
@@ -390,78 +373,49 @@ pub fn run(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn append_station_ads(
-    desired: &mut DesiredAds,
-    service_name: &str,
-    ports: &ListenPorts,
-    prefer_z21: u16,
-    prefer_wt: u16,
-    beacon: bool,
-) {
-    let (layout_id, command_station_id) = match microinit_watch::parse_dcc_bus_ids(service_name) {
-        Some(ids) => ids,
-        None => {
-            log::debug!("skipping dcc-bus service without layout/cs ids: {service_name}");
-            return;
-        }
-    };
-    let instance = microinit_watch::instance_name(command_station_id);
-    let serial = virtual_serial(layout_id, command_station_id);
+pub fn append_station_ads(desired: &mut DesiredAds, program: &Program, beacon: bool) {
+    if !program.running {
+        return;
+    }
+    let instance = bigfred_watch::instance_name(program.command_station_id);
+    let serial = virtual_serial(program.layout_id, program.command_station_id);
+    let layout_name = program.layout_name.trim();
 
-    if let Some(port) = pick_udp_port(ports, prefer_z21) {
+    if program.z21_enabled && program.z21_port != 0 {
         desired.dynamic.push(DynAd {
             entry: mdns::dcc_service_entry(
                 &instance,
                 "_z21._udp",
                 "udp",
-                port,
-                layout_id,
-                command_station_id,
+                program.z21_port,
+                program.layout_id,
+                program.command_station_id,
+                layout_name,
                 Some(serial),
             ),
         });
         if beacon {
-            desired.beacons.push(BeaconWant { port, serial });
+            desired.beacons.push(BeaconWant {
+                port: program.z21_port,
+                serial,
+            });
         }
     }
 
-    if let Some(port) = pick_tcp_port(ports, prefer_wt) {
+    if program.withrottle_enabled && program.withrottle_port != 0 {
         desired.dynamic.push(DynAd {
             entry: mdns::dcc_service_entry(
                 &instance,
                 "_withrottle._tcp",
                 "tcp",
-                port,
-                layout_id,
-                command_station_id,
+                program.withrottle_port,
+                program.layout_id,
+                program.command_station_id,
+                layout_name,
                 None,
             ),
         });
     }
-}
-
-pub fn pick_udp_port(ports: &ListenPorts, prefer: u16) -> Option<u16> {
-    if ports.has_udp(prefer) {
-        return Some(prefer);
-    }
-    let mut udp: Vec<u16> = ports.udp.iter().copied().collect();
-    udp.sort_unstable();
-    udp.iter()
-        .copied()
-        .find(|p| (21_105..=22_000).contains(p))
-        .or_else(|| udp.first().copied())
-}
-
-pub fn pick_tcp_port(ports: &ListenPorts, prefer: u16) -> Option<u16> {
-    if ports.has_tcp(prefer) {
-        return Some(prefer);
-    }
-    let mut tcp: Vec<u16> = ports.tcp.iter().copied().collect();
-    tcp.sort_unstable();
-    tcp.iter()
-        .copied()
-        .find(|p| (12_090..=12_200).contains(p))
-        .or_else(|| tcp.first().copied())
 }
 
 fn reload_loop(

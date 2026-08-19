@@ -450,8 +450,8 @@ fn addrs_for_iface(name: &str) -> (Vec<(Ipv4Addr, Ipv4Addr)>, Vec<Ipv6Addr>) {
 
 /// Helper to register a dynamic dcc-bus service (`_z21._udp` / `_withrottle._tcp`).
 ///
-/// TXT mirrors the former in-process discovery sidecar: `layoutId`,
-/// `commandStationId`, `proto`, and for Z21 also `serial`.
+/// TXT: `layoutId`, `commandStationId`, `proto`, optional `layoutName`, and for
+/// Z21 also `serial`.
 pub fn dcc_service_entry(
     instance: &str,
     type_: &str,
@@ -459,12 +459,16 @@ pub fn dcc_service_entry(
     port: u16,
     layout_id: u32,
     command_station_id: u32,
+    layout_name: &str,
     serial: Option<u32>,
 ) -> ServiceEntry {
     let mut txt = HashMap::new();
     txt.insert("proto".into(), protocol.into());
     txt.insert("layoutId".into(), layout_id.to_string());
     txt.insert("commandStationId".into(), command_station_id.to_string());
+    if !layout_name.is_empty() {
+        txt.insert("layoutName".into(), layout_name.into());
+    }
     if let Some(serial) = serial {
         txt.insert("serial".into(), serial.to_string());
     }

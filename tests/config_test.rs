@@ -13,14 +13,25 @@ fn tmp_path(name: &str) -> PathBuf {
 }
 
 #[test]
+fn bigfred_enabled_defaults_true_when_key_absent() {
+    let json = r#"{"services":[],"dccBus":{"enabled":true}}"#;
+    let cfg: Config = serde_json::from_str(json).unwrap();
+    assert!(cfg.bigfred.enabled);
+    assert!(cfg.dcc_bus.enabled);
+    assert_eq!(cfg.retry.bigfred_ms, 45_000);
+}
+
+#[test]
 fn default_roundtrip() {
     let cfg = Config::default();
     let json = serde_json::to_string_pretty(&cfg).unwrap();
     let back: Config = serde_json::from_str(&json).unwrap();
     assert_eq!(cfg, back);
     assert!(!back.dcc_bus.enabled);
+    assert!(back.bigfred.enabled);
     assert_eq!(back.dcc_bus.z21_port, 21105);
     assert_eq!(back.retry.mdns_ms, 3000);
+    assert_eq!(back.retry.bigfred_ms, 45_000);
 }
 
 #[test]

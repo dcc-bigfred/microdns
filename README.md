@@ -2,8 +2,8 @@
 
 Micro-daemon that advertises mDNS/DNS-SD services for BigFred OS.
 
-Quietly retries when interfaces, the microinit control socket, or dcc-bus are
-unavailable. Always starts successfully. Survives network drop/return and
+Quietly retries when interfaces or the BigFred control socket are unavailable.
+Always starts successfully. Survives network drop/return and
 interface add/remove via rtnetlink (with polling fallback). Resolves hostnames
 per receiving interface so a WiFi client gets the WiFi address.
 
@@ -17,9 +17,11 @@ per receiving interface so a WiFi client gets the WiFi address.
   transaction ID=`0` (`dns_parser.rs`: `let id = if self.multicast { 0 } else { self.id }`
   while `DnsOutgoing.multicast` is never set false). Remove `legacy_unicast` when
   upstream fixes that encoding.
-- Optional dcc-bus discovery: when enabled, watches microinit for a running
-  `dcc-bus` process and advertises `_z21._udp` / `_withrottle._tcp` only when
-  those ports are empirically listening
+- Optional dcc-bus discovery: when `bigfred.enabled` (default true), polls the
+  loco-server Unix socket (`$DATA_DIR/run/bigfred.sock`) for `dcc_bus_list` and
+  advertises `_z21._udp` / `_withrottle._tcp` on the ports in that JSON. Missing
+  socket is retried every `retry.bigfredMs` (default 45s). `dccBus.enabled` does
+  **not** restore microinit/`/proc` discovery.
 - Optional Z21 UDP LAN discovery beacon (LAN_GET_SERIAL_NUMBER reply broadcast)
 - Hot-reload via inotify on the config file
 - Static musl builds for linux/arm64 and linux/amd64
@@ -45,15 +47,13 @@ Default path: `$DATA_DIR/etc/microdns.json`. Created with defaults if missing.
       "txt": { "path": "/" }
     }
   ],
+  "bigfred": { "enabled": true },
   "dccBus": {
-    "enabled": false,
-    "z21Port": 21105,
-    "withrottlePort": 12090,
     "beacon": true
   },
   "retry": {
+    "bigfredMs": 45000,
     "microinitMs": 2000,
-    "procMs": 2000,
     "mdnsMs": 3000,
     "ifaceMs": 5000
   },
@@ -62,7 +62,12 @@ Default path: `$DATA_DIR/etc/microdns.json`. Created with defaults if missing.
 }
 ```
 
-- `dccBus.enabled` (default `false`): when false, only static `services[]` are advertised.
+- `bigfred.enabled` (default `true`): poll loco-server for dcc-bus programs.
+  Set `false` to advertise only static `services[]`.
+- `dccBus.beacon` (default `true`): Z21 LAN serial broadcast on advertised UDP ports.
+  `dccBus.enabled` / port guesses are ignored.
+- `retry.bigfredMs` (default `45000`): wait between probes while the socket is down.
+  `retry.microinitMs` (default `2000`) is the poll interval once connected.
 - Retry intervals are configurable; config changes are hot-reloaded.
 - `skipInterfaces` (default `[]`): extra interface-name prefixes to skip
   (case-insensitive), in addition to the built-in docker/veth/br-*/cni/
