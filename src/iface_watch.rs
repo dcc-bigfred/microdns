@@ -2,8 +2,10 @@
 //!
 //! Subscribes to `RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR` and
 //! signals [`IfaceChange`] whenever anything readable arrives. Payload parsing
-//! is intentionally skipped — the main loop re-scans interfaces on each signal.
-//! Polling remains the fallback when netlink is unavailable.
+//! is intentionally skipped — the main loop re-scans interfaces on each signal
+//! and always force-rejoins multicast, even when the address set is unchanged
+//! (suspend/resume, link down/up with the same IP). Polling remains the
+//! fallback when netlink is unavailable.
 //!
 //! The signal channel is bounded ([`IFACE_CHANGE_CAPACITY`]). Overflow drops
 //! events: the signal is idempotent ("something changed"), so losing duplicates
@@ -166,5 +168,89 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
 
         assert!(got, "expected IfaceChange after adding address on {name}");
+    }
+
+    #[test]
+    fn iface_change_on_dummy_down_up_same_addr() {
+        // Same address after a link down/up (the suspend analogue): netlink
+        // must still signal so the main loop can force IGMP leave+join.
+        let name = format!("mdnsdn{}", std::process::id() % 10000);
+        let add = std::process::Command::new("ip")
+            .args(["link", "add", &name, "type", "dummy"])
+            .output();
+        let Ok(out) = add else {
+            eprintln!("skip: ip not available");
+            return;
+        };
+        if !out.status.success() {
+            eprintln!(
+                "skip: cannot create dummy iface (need CAP_NET_ADMIN): {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+
+        let _ = std::process::Command::new("ip")
+            .args(["link", "set", &name, "up"])
+            .status();
+        let _ = std::process::Command::new("ip")
+            .args(["addr", "add", "192.0.2.11/32", "dev", &name])
+            .status();
+
+        let (rx, stop) = spawn().expect("spawn");
+        drain(&rx);
+
+        let _ = std::process::Command::new("ip")
+            .args(["link", "set", &name, "down"])
+            .status();
+        let _ = std::process::Command::new("ip")
+            .args(["link", "set", &name, "up"])
+            .status();
+
+        let got = recv_timeout(&rx, Duration::from_secs(2)).is_ok();
+
+        let _ = std::process::Command::new("ip")
+            .args(["link", "del", &name])
+            .status();
+        stop.store(true, Ordering::SeqCst);
+
+        assert!(
+            got,
+            "expected IfaceChange after down/up with the same address on {name}"
+        );
+    }
+
+    #[test]
+    fn suspend_detected_on_boottime_skew_jump() {
+        let prev = Duration::from_millis(10);
+        assert!(!crate::sys::suspend_detected(prev, prev));
+        assert!(!crate::sys::suspend_detected(
+            prev,
+            prev + Duration::from_millis(500)
+        ));
+        assert!(crate::sys::suspend_detected(
+            prev,
+            prev + Duration::from_secs(2)
+        ));
+        assert!(crate::sys::suspend_detected(
+            prev,
+            prev + Duration::from_secs(60)
+        ));
+        // Skew shrinking is not a suspend.
+        assert!(!crate::sys::suspend_detected(
+            Duration::from_secs(10),
+            Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn boottime_monotonic_skew_is_small_while_running() {
+        let a = crate::sys::boottime_monotonic_skew();
+        std::thread::sleep(Duration::from_millis(20));
+        let b = crate::sys::boottime_monotonic_skew();
+        assert!(
+            !crate::sys::suspend_detected(a, b),
+            "skew must not jump across the suspend threshold while running (a={a:?} b={b:?})"
+        );
     }
 }

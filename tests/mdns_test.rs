@@ -1,6 +1,6 @@
 use microdns::mdns::{
-    dcc_service_entry, is_allowed_iface, normalize_hostname, normalize_service_type,
-    should_skip_iface,
+    dcc_service_entry, iface_link_ready, is_allowed_iface, normalize_hostname,
+    normalize_service_type, should_skip_iface,
 };
 
 #[test]
@@ -58,6 +58,22 @@ fn allowlist_prefix_match() {
     assert!(is_allowed_iface("ETH0", &["eth".into()]));
     assert!(!is_allowed_iface("wlan0", &["eth".into()]));
     assert!(!is_allowed_iface("eth0", &["".into()]));
+}
+
+#[test]
+fn link_ready_requires_running_or_operstate_up() {
+    // IFF_UP (0x1) alone after suspend is not a live link.
+    assert!(!iface_link_ready(0x1, "down"));
+    assert!(!iface_link_ready(0x1, "dormant"));
+    assert!(!iface_link_ready(0x1, "unknown"));
+    // IFF_RUNNING (0x40) is sufficient even if operstate is unknown (dummy).
+    assert!(iface_link_ready(0x40, "unknown"));
+    assert!(iface_link_ready(0x41, "down"));
+    // operstate=up covers drivers that omit IFF_RUNNING.
+    assert!(iface_link_ready(0x1, "up"));
+    assert!(iface_link_ready(0, "up"));
+    assert!(iface_link_ready(0, "UP"));
+    assert!(!iface_link_ready(0, "down"));
 }
 
 #[test]

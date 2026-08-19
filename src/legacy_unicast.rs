@@ -12,7 +12,7 @@
 //! id encoding; keep the per-interface selection.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -79,15 +79,85 @@ pub struct ParsedQuery {
     pub qclass: u16,
 }
 
+/// Cross-thread signal so the main loop can force IGMP leave+join (and
+/// optionally recreate UDP sockets) when the address set is unchanged —
+/// the suspend/resume case, or a netlink LINK event with the same IPs.
+#[derive(Debug)]
+pub struct MembershipRefresh {
+    epoch: AtomicU64,
+    rebind: AtomicBool,
+}
+
+impl MembershipRefresh {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            epoch: AtomicU64::new(0),
+            rebind: AtomicBool::new(false),
+        }
+    }
+
+    /// Force leave+join on the existing sockets (netlink without IP churn).
+    pub fn request_rejoin(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Drop and recreate UDP sockets, then join (suspend/resume).
+    pub fn request_rebind(&self) {
+        self.rebind.store(true, Ordering::SeqCst);
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Current epoch. The responder rejoins whenever this value changes.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// Consume the rebind flag. True once per [`request_rebind`].
+    #[must_use]
+    pub fn take_rebind(&self) -> bool {
+        self.rebind.swap(false, Ordering::SeqCst)
+    }
+}
+
+impl Default for MembershipRefresh {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Whether the responder must refresh multicast memberships.
+#[must_use]
+pub fn memberships_need_refresh(snapshot_changed: bool, epoch_changed: bool) -> bool {
+    snapshot_changed || epoch_changed
+}
+
+/// Whether to leave+join even if the currently joined set already matches.
+#[must_use]
+pub fn should_replace_memberships<T: PartialEq>(joined: &[T], want: &[T], force: bool) -> bool {
+    force || joined != want
+}
+
 /// Spawn the A/AAAA responder thread.
 ///
 /// On `MDNS_PORT` (5353) joins multicast groups on preferred interfaces.
 /// On any other port (tests), binds loopback / unspecified without multicast.
 pub fn spawn(state: Arc<RwLock<AnswerSet>>, port: u16, stop: Arc<AtomicBool>) -> Result<()> {
+    spawn_with_refresh(state, port, stop, Arc::new(MembershipRefresh::new()))
+}
+
+/// Like [`spawn`], with a shared refresh signal for netlink / suspend.
+pub fn spawn_with_refresh(
+    state: Arc<RwLock<AnswerSet>>,
+    port: u16,
+    stop: Arc<AtomicBool>,
+    refresh: Arc<MembershipRefresh>,
+) -> Result<()> {
     thread::Builder::new()
         .name("legacy-unicast".into())
         .spawn(move || {
-            if let Err(e) = run_loop(state, port, stop) {
+            if let Err(e) = run_loop(state, port, stop, refresh) {
                 log::warn!("legacy unicast responder stopped: {e}");
             }
         })
@@ -95,7 +165,12 @@ pub fn spawn(state: Arc<RwLock<AnswerSet>>, port: u16, stop: Arc<AtomicBool>) ->
     Ok(())
 }
 
-fn run_loop(state: Arc<RwLock<AnswerSet>>, port: u16, stop: Arc<AtomicBool>) -> Result<()> {
+fn run_loop(
+    state: Arc<RwLock<AnswerSet>>,
+    port: u16,
+    stop: Arc<AtomicBool>,
+    refresh: Arc<MembershipRefresh>,
+) -> Result<()> {
     let test_mode = port != MDNS_PORT;
     let mut warned_bind = false;
     let mut sock_v4: Option<Socket> = None;
@@ -104,10 +179,23 @@ fn run_loop(state: Arc<RwLock<AnswerSet>>, port: u16, stop: Arc<AtomicBool>) -> 
     let mut joined_ifindexes: Vec<u32> = Vec::new();
     // Cache of the AnswerSet snapshot last used to compute multicast joins.
     // refresh_memberships is expensive (getifaddrs + /sys read) so we only
-    // recompute when the AnswerSet actually changes.
+    // recompute when the AnswerSet actually changes — or when the main loop
+    // bumps the refresh epoch (same IPs after suspend / link flap).
     let mut last_answer_snapshot: Option<AnswerSet> = None;
+    let mut last_epoch: u64 = 0;
 
     while !stop.load(Ordering::SeqCst) {
+        if !test_mode && refresh.take_rebind() {
+            log::info!("legacy unicast rebinding UDP sockets after suspend/resume");
+            sock_v4 = None;
+            sock_v6 = None;
+            joined_v4.clear();
+            joined_ifindexes.clear();
+            last_answer_snapshot = None;
+            // Keep last_epoch behind the signal so the post-bind pass force-joins.
+            last_epoch = refresh.epoch().saturating_sub(1);
+        }
+
         if sock_v4.is_none() {
             match bind_v4(port, test_mode) {
                 Ok(s) => {
@@ -143,15 +231,19 @@ fn run_loop(state: Arc<RwLock<AnswerSet>>, port: u16, stop: Arc<AtomicBool>) -> 
         if !test_mode {
             let current_snapshot = state.read().map(|g| g.clone()).ok();
             let changed = current_snapshot.as_ref() != last_answer_snapshot.as_ref();
-            if changed {
+            let epoch = refresh.epoch();
+            let epoch_changed = epoch != last_epoch;
+            if memberships_need_refresh(changed, epoch_changed) {
                 refresh_memberships(
                     sock_v4.as_ref(),
                     sock_v6.as_ref(),
                     &state,
                     &mut joined_v4,
                     &mut joined_ifindexes,
+                    epoch_changed,
                 );
                 last_answer_snapshot = current_snapshot;
+                last_epoch = epoch;
             }
         }
 
@@ -265,6 +357,7 @@ fn refresh_memberships(
     state: &RwLock<AnswerSet>,
     joined_v4: &mut Vec<Ipv4Addr>,
     joined_ifindexes: &mut Vec<u32>,
+    force: bool,
 ) {
     // One read, so the addresses and the skip/allow lists are from the same
     // generation of the AnswerSet.
@@ -288,7 +381,7 @@ fn refresh_memberships(
     want_idx.dedup();
 
     if let Some(sock) = sock_v4 {
-        if *joined_v4 != want_v4 {
+        if should_replace_memberships(joined_v4, &want_v4, force) {
             for ip in joined_v4.iter() {
                 let _ = sock.leave_multicast_v4(&MDNS_GROUP_V4, ip);
             }
@@ -322,7 +415,7 @@ fn refresh_memberships(
     }
 
     if let Some(sock) = sock_v6 {
-        if *joined_ifindexes != want_idx {
+        if should_replace_memberships(joined_ifindexes, &want_idx, force) {
             for idx in joined_ifindexes.iter() {
                 let _ = sock.leave_multicast_v6(&MDNS_GROUP_V6, *idx);
             }

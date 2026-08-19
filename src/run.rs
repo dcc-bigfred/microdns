@@ -13,11 +13,12 @@ use crate::config::{self, Config, ServiceEntry};
 use crate::config_watch::{self, ReloadSignal};
 use crate::error::Result;
 use crate::iface_watch::{self, IfaceChange};
-use crate::legacy_unicast::{self, AnswerSet};
+use crate::legacy_unicast::{self, AnswerSet, MembershipRefresh};
 use crate::mdns::{self, MdnsPublisher};
 use crate::microinit_watch;
 use crate::proc_scan::{self, ListenPorts};
 use crate::signals;
+use crate::sys;
 use crate::version;
 
 /// Shared runtime state updated on config reload.
@@ -129,10 +130,12 @@ pub fn run(config_path: &Path) -> Result<()> {
     let publisher = Arc::new(Mutex::new(MdnsPublisher::new()));
     let beacons: Arc<Mutex<Vec<ActiveBeacon>>> = Arc::new(Mutex::new(Vec::new()));
     let answer_set = Arc::new(RwLock::new(AnswerSet::default()));
-    if let Err(e) = legacy_unicast::spawn(
+    let membership = Arc::new(MembershipRefresh::new());
+    if let Err(e) = legacy_unicast::spawn_with_refresh(
         Arc::clone(&answer_set),
         legacy_unicast::MDNS_PORT,
         Arc::clone(&stop),
+        Arc::clone(&membership),
     ) {
         log::warn!("legacy unicast responder failed to start: {e}");
     }
@@ -163,19 +166,51 @@ pub fn run(config_path: &Path) -> Result<()> {
         interfaces: Vec::new(),
     };
     let mut registered: HashMap<String, ServiceEntry> = HashMap::new();
+    let mut force_reannounce = false;
+    let mut recreate_daemon = false;
+    let mut last_skew = sys::boottime_monotonic_skew();
 
     while !signals::shutdown_requested() && !stop.load(Ordering::SeqCst) {
+        if sys::suspend_detected(last_skew, sys::boottime_monotonic_skew()) {
+            last_skew = sys::boottime_monotonic_skew();
+            apply_wake(
+                WakeReason::Suspend,
+                &membership,
+                &mut force_reannounce,
+                &mut recreate_daemon,
+            );
+        }
+
         let cfg = shared.config.read().map(|c| c.clone()).unwrap_or_default();
         let mdns_ms = cfg.retry.mdns_ms;
 
-        // Ensure mDNS daemon (quiet retry).
+        // Ensure mDNS daemon (quiet retry). Recreate after suspend so mdns-sd
+        // binds fresh sockets and rejoins 224.0.0.251.
         {
             let mut pub_guard = lock_mutex(&publisher);
-            match pub_guard.ensure_daemon() {
-                Ok(()) => mdns_thr.ok("mDNS daemon"),
+            let daemon_res = if recreate_daemon {
+                pub_guard.recreate_daemon()
+            } else {
+                pub_guard.ensure_daemon()
+            };
+            match daemon_res {
+                Ok(()) => {
+                    if recreate_daemon {
+                        registered.clear();
+                        recreate_daemon = false;
+                    }
+                    mdns_thr.ok("mDNS daemon");
+                }
                 Err(e) => {
                     mdns_thr.fail("mDNS daemon", &e);
-                    sleep_or_iface(&iface_rx, Duration::from_millis(mdns_ms));
+                    let reason =
+                        sleep_or_iface(&iface_rx, Duration::from_millis(mdns_ms), &mut last_skew);
+                    apply_wake(
+                        reason,
+                        &membership,
+                        &mut force_reannounce,
+                        &mut recreate_daemon,
+                    );
                     continue;
                 }
             }
@@ -194,7 +229,8 @@ pub fn run(config_path: &Path) -> Result<()> {
                     cfg.interfaces, cfg.skip_interfaces
                 )
             } else {
-                let mut why = String::from("no UP non-loopback IPv4 (skipping docker/veth/br-*");
+                let mut why =
+                    String::from("no running non-loopback IPv4 (skipping docker/veth/br-*");
                 if !cfg.skip_interfaces.is_empty() {
                     why.push_str(&format!(", configured {:?}", cfg.skip_interfaces));
                 }
@@ -300,9 +336,11 @@ pub fn run(config_path: &Path) -> Result<()> {
             }
         }
 
-        // Reconcile advertisements when desired set changes (incl. IP churn).
-        if desired != last_desired {
-            let ips_changed = desired.ips != last_desired.ips
+        // Reconcile advertisements when desired set changes (incl. IP churn)
+        // or when netlink/suspend forced a refresh with the same IPs.
+        if desired != last_desired || force_reannounce {
+            let ips_changed = force_reannounce
+                || desired.ips != last_desired.ips
                 || desired.ips_v6 != last_desired.ips_v6
                 || desired.interfaces != last_desired.interfaces
                 || desired.skip_interfaces != last_desired.skip_interfaces;
@@ -312,16 +350,27 @@ pub fn run(config_path: &Path) -> Result<()> {
             } else {
                 mdns_thr.ok("mDNS register");
                 last_desired = desired;
+                force_reannounce = false;
             }
         }
 
-        // Sleep until next poll; wake early on shutdown or netlink iface change.
+        // Sleep until next poll; wake early on shutdown, netlink, or suspend.
         let sleep_ms = if dcc_enabled {
             retry.proc_ms.min(retry.microinit_ms).min(retry.iface_ms)
         } else {
             retry.iface_ms.min(retry.mdns_ms)
         };
-        sleep_or_iface(&iface_rx, Duration::from_millis(sleep_ms.max(500)));
+        let reason = sleep_or_iface(
+            &iface_rx,
+            Duration::from_millis(sleep_ms.max(500)),
+            &mut last_skew,
+        );
+        apply_wake(
+            reason,
+            &membership,
+            &mut force_reannounce,
+            &mut recreate_daemon,
+        );
     }
 
     log::info!("microdns shutting down");
@@ -596,24 +645,129 @@ fn log_detected_interfaces(answers: &AnswerSet) {
     }
 }
 
-/// Sleep until `total` elapses, shutdown is requested, or a netlink iface change arrives.
-fn sleep_or_iface(iface_rx: &std::sync::mpsc::Receiver<IfaceChange>, total: Duration) {
+/// Why the main loop woke from its idle wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WakeReason {
+    Timeout,
+    IfaceChange,
+    Suspend,
+    Shutdown,
+}
+
+fn apply_wake(
+    reason: WakeReason,
+    membership: &MembershipRefresh,
+    force_reannounce: &mut bool,
+    recreate_daemon: &mut bool,
+) {
+    match reason {
+        WakeReason::IfaceChange => {
+            // Same IPs after a link flap / resume still need IGMP leave+join
+            // and an mDNS announce; AddressSet equality would skip both.
+            membership.request_rejoin();
+            *force_reannounce = true;
+        }
+        WakeReason::Suspend => {
+            log::info!("suspend/resume detected; rebinding mDNS sockets");
+            membership.request_rebind();
+            *recreate_daemon = true;
+            *force_reannounce = true;
+        }
+        WakeReason::Timeout | WakeReason::Shutdown => {}
+    }
+}
+
+/// Sleep until `total` elapses, shutdown is requested, a netlink iface change
+/// arrives, or CLOCK_BOOTTIME/MONOTONIC skew jumps (suspend/resume).
+fn sleep_or_iface(
+    iface_rx: &std::sync::mpsc::Receiver<IfaceChange>,
+    total: Duration,
+    last_skew: &mut Duration,
+) -> WakeReason {
     let deadline = Instant::now() + total;
     while Instant::now() < deadline {
         if signals::shutdown_requested() {
-            return;
+            return WakeReason::Shutdown;
+        }
+        let now_skew = sys::boottime_monotonic_skew();
+        if sys::suspend_detected(*last_skew, now_skew) {
+            *last_skew = now_skew;
+            return WakeReason::Suspend;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         let slice = remaining.min(Duration::from_millis(200));
         match iface_watch::recv_timeout(iface_rx, slice) {
             Ok(IfaceChange) => {
+                let now_skew = sys::boottime_monotonic_skew();
+                if sys::suspend_detected(*last_skew, now_skew) {
+                    *last_skew = now_skew;
+                    return WakeReason::Suspend;
+                }
                 log::debug!("iface change signaled; refreshing");
-                return;
+                return WakeReason::IfaceChange;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 thread::sleep(slice);
             }
         }
+    }
+    let now_skew = sys::boottime_monotonic_skew();
+    if sys::suspend_detected(*last_skew, now_skew) {
+        *last_skew = now_skew;
+        return WakeReason::Suspend;
+    }
+    WakeReason::Timeout
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn iface_change_forces_rejoin_not_rebind() {
+        let membership = MembershipRefresh::new();
+        let mut force = false;
+        let mut recreate = false;
+        apply_wake(
+            WakeReason::IfaceChange,
+            &membership,
+            &mut force,
+            &mut recreate,
+        );
+        assert!(force);
+        assert!(!recreate);
+        assert_eq!(membership.epoch(), 1);
+        assert!(!membership.take_rebind());
+    }
+
+    #[test]
+    fn suspend_forces_rebind_and_recreate() {
+        let membership = MembershipRefresh::new();
+        let mut force = false;
+        let mut recreate = false;
+        apply_wake(WakeReason::Suspend, &membership, &mut force, &mut recreate);
+        assert!(force);
+        assert!(recreate);
+        assert_eq!(membership.epoch(), 1);
+        assert!(membership.take_rebind());
+    }
+
+    #[test]
+    fn sleep_returns_iface_change() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(IfaceChange).unwrap();
+        let mut last_skew = sys::boottime_monotonic_skew();
+        let reason = sleep_or_iface(&rx, Duration::from_secs(2), &mut last_skew);
+        assert_eq!(reason, WakeReason::IfaceChange);
+    }
+
+    #[test]
+    fn sleep_times_out_without_signal() {
+        let (_tx, rx) = mpsc::sync_channel::<IfaceChange>(1);
+        let mut last_skew = sys::boottime_monotonic_skew();
+        let reason = sleep_or_iface(&rx, Duration::from_millis(50), &mut last_skew);
+        assert_eq!(reason, WakeReason::Timeout);
     }
 }
