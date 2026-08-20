@@ -12,6 +12,7 @@ use crate::beacon::{self, virtual_serial};
 use crate::bigfred_watch::{self, Program};
 use crate::config::{self, Config, ServiceEntry};
 use crate::config_watch::{self, ReloadSignal};
+use crate::ctl;
 use crate::error::Result;
 use crate::iface_watch::{self, IfaceChange};
 use crate::legacy_unicast::{self, AnswerSet, MembershipRefresh};
@@ -81,7 +82,7 @@ pub struct BeaconWant {
 ///
 /// `ips` (IPv4) and `ips_v6` (IPv6) are both included so DHCP / SLAAC privacy
 /// address churn triggers re-registration of A/AAAA via mdns-sd.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DesiredAds {
     pub static_services: Vec<ServiceEntry>,
     pub dynamic: Vec<DynAd>,
@@ -99,6 +100,11 @@ struct ActiveBeacon {
 
 /// Run the daemon until shutdown signal.
 pub fn run(config_path: &Path) -> Result<()> {
+    run_with_socket(config_path, &ctl::default_socket())
+}
+
+/// Like [`run`], with an explicit control-socket path.
+pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
     let cfg = config::load_or_create(config_path)?;
     log::info!(
         "microdns starting version={} config={}",
@@ -128,6 +134,8 @@ pub fn run(config_path: &Path) -> Result<()> {
 
     let publisher = Arc::new(Mutex::new(MdnsPublisher::new()));
     let beacons: Arc<Mutex<Vec<ActiveBeacon>>> = Arc::new(Mutex::new(Vec::new()));
+    let desired_snapshot = Arc::new(RwLock::new(DesiredAds::default()));
+    ctl::serve(ctl_socket, Arc::clone(&desired_snapshot))?;
     let answer_set = Arc::new(RwLock::new(AnswerSet::default()));
     let membership = Arc::new(MembershipRefresh::new());
     if let Err(e) = legacy_unicast::spawn_with_refresh(
@@ -156,15 +164,7 @@ pub fn run(config_path: &Path) -> Result<()> {
     let mut last_programs: Option<Vec<Program>> = None;
     let mut next_bigfred_probe = Instant::now();
 
-    let mut last_desired = DesiredAds {
-        static_services: Vec::new(),
-        dynamic: Vec::new(),
-        beacons: Vec::new(),
-        ips: Vec::new(),
-        ips_v6: Vec::new(),
-        skip_interfaces: Vec::new(),
-        interfaces: Vec::new(),
-    };
+    let mut last_desired = DesiredAds::default();
     let mut registered: HashMap<String, ServiceEntry> = HashMap::new();
     let mut force_reannounce = false;
     let mut recreate_daemon = false;
@@ -314,6 +314,10 @@ pub fn run(config_path: &Path) -> Result<()> {
                 desired.beacons.sort_unstable();
                 desired.beacons.dedup();
             }
+        }
+
+        if let Ok(mut w) = desired_snapshot.write() {
+            *w = desired.clone();
         }
 
         // Reconcile advertisements when desired set changes (incl. IP churn)
