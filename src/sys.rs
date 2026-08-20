@@ -7,6 +7,7 @@ use std::io::{ErrorKind, IoSliceMut};
 use std::mem::{self, MaybeUninit};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::Once;
 use std::time::Duration;
 
 use socket2::{SockAddr, SockAddrStorage, Socket};
@@ -263,6 +264,8 @@ fn clock_gettime_duration(clock_id: libc::clockid_t) -> std::io::Result<Duration
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // CLOCK_BOOTTIME / CLOCK_MONOTONIC are non-negative from boot; a negative
+    // tv_sec is not reachable in practice, so saturating to zero is fine.
     let sec = u64::try_from(ts.tv_sec).unwrap_or(0);
     let nsec = u32::try_from(ts.tv_nsec).unwrap_or(0);
     Ok(Duration::new(sec, nsec))
@@ -274,9 +277,19 @@ fn clock_gettime_duration(clock_id: libc::clockid_t) -> std::io::Result<Duration
 /// After resume the difference jumps by (approximately) the sleep duration.
 #[must_use]
 pub fn boottime_monotonic_skew() -> Duration {
-    let boot = clock_gettime_duration(libc::CLOCK_BOOTTIME).unwrap_or_default();
-    let mono = clock_gettime_duration(libc::CLOCK_MONOTONIC).unwrap_or_default();
-    boot.saturating_sub(mono)
+    match (
+        clock_gettime_duration(libc::CLOCK_BOOTTIME),
+        clock_gettime_duration(libc::CLOCK_MONOTONIC),
+    ) {
+        (Ok(boot), Ok(mono)) => boot.saturating_sub(mono),
+        (Err(e), _) | (_, Err(e)) => {
+            static WARN: Once = Once::new();
+            WARN.call_once(|| {
+                log::warn!("clock_gettime failed; suspend detection disabled: {e}");
+            });
+            Duration::ZERO
+        }
+    }
 }
 
 /// True when the boottime/monotonic skew jumped by at least

@@ -62,15 +62,18 @@ fn allowlist_prefix_match() {
 
 #[test]
 fn link_ready_requires_running_or_operstate_up() {
-    // IFF_UP (0x1) alone after suspend is not a live link.
-    assert!(!iface_link_ready(0x1, "down"));
-    assert!(!iface_link_ready(0x1, "dormant"));
-    assert!(!iface_link_ready(0x1, "unknown"));
-    // IFF_RUNNING (0x40) is sufficient even if operstate is unknown (dummy).
-    assert!(iface_link_ready(0x40, "unknown"));
-    assert!(iface_link_ready(0x41, "down"));
+    // IFF_UP alone after suspend is not a live link.
+    assert!(!iface_link_ready(libc::IFF_UP as u32, "down"));
+    assert!(!iface_link_ready(libc::IFF_UP as u32, "dormant"));
+    assert!(!iface_link_ready(libc::IFF_UP as u32, "unknown"));
+    // IFF_RUNNING is sufficient even if operstate is unknown (dummy).
+    assert!(iface_link_ready(libc::IFF_RUNNING as u32, "unknown"));
+    assert!(iface_link_ready(
+        (libc::IFF_UP | libc::IFF_RUNNING) as u32,
+        "down"
+    ));
     // operstate=up covers drivers that omit IFF_RUNNING.
-    assert!(iface_link_ready(0x1, "up"));
+    assert!(iface_link_ready(libc::IFF_UP as u32, "up"));
     assert!(iface_link_ready(0, "up"));
     assert!(iface_link_ready(0, "UP"));
     assert!(!iface_link_ready(0, "down"));

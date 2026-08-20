@@ -289,10 +289,6 @@ fn iface_usable(iface: &IfaceInfo, allow: &[String], skip: &[String]) -> bool {
     true
 }
 
-/// Kernel `IFF_RUNNING` — carrier/operational, not merely administratively up.
-const IFF_RUNNING: u32 = 0x40;
-const IFF_LOOPBACK: u32 = 0x8;
-
 /// Whether the link is usable for mDNS: `IFF_RUNNING` or `operstate == "up"`.
 ///
 /// `IFF_UP` alone is not enough — after suspend a Wi‑Fi NIC often stays
@@ -300,7 +296,7 @@ const IFF_LOOPBACK: u32 = 0x8;
 /// address. Treating that as live skips the multicast rejoin.
 #[must_use]
 pub fn iface_link_ready(flags_val: u32, operstate: &str) -> bool {
-    (flags_val & IFF_RUNNING) != 0 || operstate.eq_ignore_ascii_case("up")
+    (flags_val & libc::IFF_RUNNING as u32) != 0 || operstate.eq_ignore_ascii_case("up")
 }
 
 fn is_ipv6_link_local(ip: &Ipv6Addr) -> bool {
@@ -386,7 +382,7 @@ fn list_interfaces() -> Result<Vec<IfaceInfo>> {
         let flags_val = u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16).unwrap_or(0);
         // IFF_RUNNING (carrier) or operstate=up — not IFF_UP alone (see iface_link_ready).
         let is_up = iface_link_ready(flags_val, &operstate);
-        let is_loopback = (flags_val & IFF_LOOPBACK) != 0 || name == "lo";
+        let is_loopback = (flags_val & libc::IFF_LOOPBACK as u32) != 0 || name == "lo";
         let ifindex = fs::read_to_string(entry.path().join("ifindex"))
             .ok()
             .and_then(|s| s.trim().parse().ok())

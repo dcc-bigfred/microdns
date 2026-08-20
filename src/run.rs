@@ -171,8 +171,9 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
     let mut last_skew = sys::boottime_monotonic_skew();
 
     while !signals::shutdown_requested() && !stop.load(Ordering::SeqCst) {
-        if sys::suspend_detected(last_skew, sys::boottime_monotonic_skew()) {
-            last_skew = sys::boottime_monotonic_skew();
+        let now_skew = sys::boottime_monotonic_skew();
+        if sys::suspend_detected(last_skew, now_skew) {
+            last_skew = now_skew;
             apply_wake(
                 WakeReason::Suspend,
                 &membership,
@@ -620,6 +621,11 @@ fn apply_wake(
 ) {
     match reason {
         WakeReason::IfaceChange => {
+            // Suspend already queued a full rebind+recreate; don't bump epoch
+            // again for a follow-up netlink event (link flap after wake).
+            if *recreate_daemon {
+                return;
+            }
             // Same IPs after a link flap / resume still need IGMP leave+join
             // and an mDNS announce; AddressSet equality would skip both.
             membership.request_rejoin();
@@ -637,23 +643,36 @@ fn apply_wake(
 
 /// Sleep until `total` elapses, shutdown is requested, a netlink iface change
 /// arrives, or CLOCK_BOOTTIME/MONOTONIC skew jumps (suspend/resume).
+///
+/// Netlink is polled at [`IFACE_POLL_SLICE`]. Suspend detection is a pair of
+/// `clock_gettime` syscalls, so it runs at most once per
+/// [`SUSPEND_CHECK_INTERVAL`] unless netlink already woke us.
+const IFACE_POLL_SLICE: Duration = Duration::from_millis(200);
+const SUSPEND_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
 fn sleep_or_iface(
     iface_rx: &std::sync::mpsc::Receiver<IfaceChange>,
     total: Duration,
     last_skew: &mut Duration,
 ) -> WakeReason {
     let deadline = Instant::now() + total;
+    let mut next_skew_check = Instant::now();
     while Instant::now() < deadline {
         if signals::shutdown_requested() {
             return WakeReason::Shutdown;
         }
-        let now_skew = sys::boottime_monotonic_skew();
-        if sys::suspend_detected(*last_skew, now_skew) {
-            *last_skew = now_skew;
-            return WakeReason::Suspend;
+        let now = Instant::now();
+        if now >= next_skew_check {
+            let now_skew = sys::boottime_monotonic_skew();
+            if sys::suspend_detected(*last_skew, now_skew) {
+                *last_skew = now_skew;
+                return WakeReason::Suspend;
+            }
+            next_skew_check = now + SUSPEND_CHECK_INTERVAL;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let slice = remaining.min(Duration::from_millis(200));
+        let until_skew = next_skew_check.saturating_duration_since(Instant::now());
+        let slice = remaining.min(IFACE_POLL_SLICE).min(until_skew);
         match iface_watch::recv_timeout(iface_rx, slice) {
             Ok(IfaceChange) => {
                 let now_skew = sys::boottime_monotonic_skew();
@@ -709,6 +728,24 @@ mod tests {
         assert!(force);
         assert!(recreate);
         assert_eq!(membership.epoch(), 1);
+        assert!(membership.take_rebind());
+    }
+
+    #[test]
+    fn iface_change_does_not_bump_epoch_when_recreate_pending() {
+        let membership = MembershipRefresh::new();
+        let mut force = false;
+        let mut recreate = false;
+        apply_wake(WakeReason::Suspend, &membership, &mut force, &mut recreate);
+        apply_wake(
+            WakeReason::IfaceChange,
+            &membership,
+            &mut force,
+            &mut recreate,
+        );
+        assert_eq!(membership.epoch(), 1);
+        assert!(recreate);
+        assert!(force);
         assert!(membership.take_rebind());
     }
 

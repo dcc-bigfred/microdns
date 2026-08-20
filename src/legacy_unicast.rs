@@ -127,18 +127,6 @@ impl Default for MembershipRefresh {
     }
 }
 
-/// Whether the responder must refresh multicast memberships.
-#[must_use]
-pub fn memberships_need_refresh(snapshot_changed: bool, epoch_changed: bool) -> bool {
-    snapshot_changed || epoch_changed
-}
-
-/// Whether to leave+join even if the currently joined set already matches.
-#[must_use]
-pub fn should_replace_memberships<T: PartialEq>(joined: &[T], want: &[T], force: bool) -> bool {
-    force || joined != want
-}
-
 /// Spawn the A/AAAA responder thread.
 ///
 /// On `MDNS_PORT` (5353) joins multicast groups on preferred interfaces.
@@ -233,7 +221,7 @@ fn run_loop(
             let changed = current_snapshot.as_ref() != last_answer_snapshot.as_ref();
             let epoch = refresh.epoch();
             let epoch_changed = epoch != last_epoch;
-            if memberships_need_refresh(changed, epoch_changed) {
+            if changed || epoch_changed {
                 refresh_memberships(
                     sock_v4.as_ref(),
                     sock_v6.as_ref(),
@@ -381,7 +369,7 @@ fn refresh_memberships(
     want_idx.dedup();
 
     if let Some(sock) = sock_v4 {
-        if should_replace_memberships(joined_v4, &want_v4, force) {
+        if force || *joined_v4 != want_v4 {
             for ip in joined_v4.iter() {
                 let _ = sock.leave_multicast_v4(&MDNS_GROUP_V4, ip);
             }
@@ -415,7 +403,7 @@ fn refresh_memberships(
     }
 
     if let Some(sock) = sock_v6 {
-        if should_replace_memberships(joined_ifindexes, &want_idx, force) {
+        if force || *joined_ifindexes != want_idx {
             for idx in joined_ifindexes.iter() {
                 let _ = sock.leave_multicast_v6(&MDNS_GROUP_V6, *idx);
             }
