@@ -53,6 +53,44 @@ impl BigFredConfig {
     }
 }
 
+/// Default microinit control socket under the data root.
+#[must_use]
+pub fn default_microinit_socket() -> PathBuf {
+    datadir::path(["run", "microinit.sock"])
+}
+
+/// Watch microinit for services labeled `microdns-port` / `microdns-type`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MicroinitConfig {
+    /// Feature toggle; default **true** when the key is absent.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Override socket path. Empty / omitted → `$DATA_DIR/run/microinit.sock`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<String>,
+}
+
+impl Default for MicroinitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            socket: None,
+        }
+    }
+}
+
+impl MicroinitConfig {
+    /// Resolved control-socket path.
+    #[must_use]
+    pub fn socket_path(&self) -> PathBuf {
+        match &self.socket {
+            Some(s) if !s.trim().is_empty() => PathBuf::from(s),
+            _ => default_microinit_socket(),
+        }
+    }
+}
+
 /// One static DNS-SD service entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -108,6 +146,10 @@ pub struct RetryConfig {
     /// Retry interval when the BigFred socket is missing (milliseconds).
     #[serde(default = "default_bigfred_ms")]
     pub bigfred_ms: u64,
+    /// Reconnect backoff while the microinit watch socket is down (milliseconds).
+    /// Independent of `microinitMs`, which is a leftover alias for [`Self::poll_ms`].
+    #[serde(default = "default_microinit_reconnect_ms")]
+    pub microinit_reconnect_ms: u64,
 }
 
 impl Default for RetryConfig {
@@ -117,12 +159,13 @@ impl Default for RetryConfig {
             mdns_ms: default_mdns_ms(),
             iface_ms: default_iface_ms(),
             bigfred_ms: default_bigfred_ms(),
+            microinit_reconnect_ms: default_microinit_reconnect_ms(),
         }
     }
 }
 
 fn default_poll_ms() -> u64 {
-    45_000
+    25_000
 }
 fn default_mdns_ms() -> u64 {
     3000
@@ -133,6 +176,9 @@ fn default_iface_ms() -> u64 {
 fn default_bigfred_ms() -> u64 {
     45_000
 }
+fn default_microinit_reconnect_ms() -> u64 {
+    3000
+}
 
 /// Top-level microdns configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -142,6 +188,8 @@ pub struct Config {
     pub services: Vec<ServiceEntry>,
     #[serde(default)]
     pub bigfred: BigFredConfig,
+    #[serde(default)]
+    pub microinit: MicroinitConfig,
     #[serde(default)]
     pub dcc_bus: DccBusConfig,
     #[serde(default)]
@@ -174,6 +222,7 @@ impl Default for Config {
                 txt: Some(HashMap::from([("path".into(), "/".into())])),
             }],
             bigfred: BigFredConfig::default(),
+            microinit: MicroinitConfig::default(),
             dcc_bus: DccBusConfig::default(),
             retry: RetryConfig::default(),
             skip_interfaces: Vec::new(),
@@ -228,7 +277,7 @@ fn validate_iface_prefixes(field: &str, entries: &[String]) -> Result<()> {
 }
 
 /// Accept `_name._tcp` / `_name._udp`, optionally with a `.local` suffix.
-fn validate_service_type(name: &str, type_: &str) -> Result<()> {
+pub(crate) fn validate_service_type(name: &str, type_: &str) -> Result<()> {
     if type_.is_empty() {
         return Err(Error::Config(format!(
             "service '{name}': type must not be empty"
@@ -283,6 +332,23 @@ fn validate_protocol(name: &str, type_: &str, protocol: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// `tcp` / `udp` from a validated DNS-SD type, or `None` if the type is unusable.
+#[must_use]
+pub(crate) fn protocol_from_type(type_: &str) -> Option<&'static str> {
+    let base = type_
+        .trim()
+        .trim_end_matches('.')
+        .strip_suffix(".local")
+        .unwrap_or(type_.trim().trim_end_matches('.'));
+    if base.ends_with("._tcp") {
+        Some("tcp")
+    } else if base.ends_with("._udp") {
+        Some("udp")
+    } else {
+        None
+    }
 }
 
 /// Load config from `path`, creating a default file if missing.

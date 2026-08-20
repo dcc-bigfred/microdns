@@ -69,6 +69,7 @@ fn append_station_uses_api_ports_not_defaults() {
         .unwrap();
     assert_eq!(wit.entry.name, "BigFred #5");
     assert_eq!(wit.entry.port, 12091);
+    assert_eq!(wit.source, microdns::run::DynSource::DccBus);
     let txt = wit.entry.txt.as_ref().unwrap();
     assert_eq!(txt.get("layoutId").map(String::as_str), Some("2"));
     assert_eq!(txt.get("layoutName").map(String::as_str), Some("Klubowa"));

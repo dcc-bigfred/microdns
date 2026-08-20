@@ -17,6 +17,7 @@ fn bigfred_enabled_defaults_true_when_key_absent() {
     let json = r#"{"services":[],"dccBus":{"enabled":true,"z21Port":21105}}"#;
     let cfg: Config = serde_json::from_str(json).unwrap();
     assert!(cfg.bigfred.enabled);
+    assert!(cfg.microinit.enabled);
     assert!(cfg.dcc_bus.beacon);
     assert_eq!(cfg.retry.bigfred_ms, 45_000);
 }
@@ -29,6 +30,18 @@ fn leftover_retry_keys_are_ignored_or_aliased() {
         }"#;
     let cfg: Config = serde_json::from_str(json).unwrap();
     assert_eq!(cfg.retry.poll_ms, 1500);
+    assert_eq!(cfg.retry.microinit_reconnect_ms, 3000);
+}
+
+#[test]
+fn microinit_reconnect_ms_is_not_poll_ms() {
+    let json = r#"{
+            "services": [],
+            "retry": { "microinitReconnectMs": 1234, "microinitMs": 1500 }
+        }"#;
+    let cfg: Config = serde_json::from_str(json).unwrap();
+    assert_eq!(cfg.retry.microinit_reconnect_ms, 1234);
+    assert_eq!(cfg.retry.poll_ms, 1500);
 }
 
 #[test]
@@ -39,9 +52,11 @@ fn default_roundtrip() {
     assert_eq!(cfg, back);
     assert!(back.dcc_bus.beacon);
     assert!(back.bigfred.enabled);
-    assert_eq!(back.retry.poll_ms, 45_000);
+    assert!(back.microinit.enabled);
+    assert_eq!(back.retry.poll_ms, 25_000);
     assert_eq!(back.retry.mdns_ms, 3000);
     assert_eq!(back.retry.bigfred_ms, 45_000);
+    assert_eq!(back.retry.microinit_reconnect_ms, 3000);
     assert!(!json.contains("microinitMs"));
     assert!(!json.contains("procMs"));
     assert!(!json.contains("z21Port"));
