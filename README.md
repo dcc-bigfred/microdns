@@ -52,7 +52,7 @@ Default path: `$DATA_DIR/etc/microdns.json`. Created with defaults if missing.
   },
   "retry": {
     "bigfredMs": 45000,
-    "pollMs": 2000,
+    "pollMs": 45000,
     "mdnsMs": 3000,
     "ifaceMs": 5000
   },
@@ -65,7 +65,7 @@ Default path: `$DATA_DIR/etc/microdns.json`. Created with defaults if missing.
   Set `false` to advertise only static `services[]`.
 - `dccBus.beacon` (default `true`): Z21 LAN serial broadcast on advertised UDP ports.
 - `retry.bigfredMs` (default `45000`): wait between probes while the socket is down.
-  `retry.pollMs` (default `2000`) is the poll interval once connected.
+  `retry.pollMs` (default `45000`) is the poll interval once connected.
   Existing files may still use `retry.microinitMs`; that alias is accepted.
 - Retry intervals are configurable; config changes are hot-reloaded.
 - `skipInterfaces` (default `[]`): extra interface-name prefixes to skip

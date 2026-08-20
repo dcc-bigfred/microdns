@@ -122,7 +122,7 @@ impl Default for RetryConfig {
 }
 
 fn default_poll_ms() -> u64 {
-    2000
+    45_000
 }
 fn default_mdns_ms() -> u64 {
     3000

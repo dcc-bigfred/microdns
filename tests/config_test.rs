@@ -39,7 +39,7 @@ fn default_roundtrip() {
     assert_eq!(cfg, back);
     assert!(back.dcc_bus.beacon);
     assert!(back.bigfred.enabled);
-    assert_eq!(back.retry.poll_ms, 2000);
+    assert_eq!(back.retry.poll_ms, 45_000);
     assert_eq!(back.retry.mdns_ms, 3000);
     assert_eq!(back.retry.bigfred_ms, 45_000);
     assert!(!json.contains("microinitMs"));
