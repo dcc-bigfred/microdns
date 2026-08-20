@@ -2,7 +2,7 @@
 //!
 //! Protocol matches loco-server / microinit: 4-byte little-endian length + JSON.
 //! Request `{ "type": "services_list" }` returns the current DesiredAds snapshot
-//! (static `services[]` plus dynamic dcc-bus DNS-SD; not Z21 LAN beacons).
+//! (static `services[]` plus dynamic dcc-bus / microinit DNS-SD; not Z21 LAN beacons).
 
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::ServiceEntry;
 use crate::datadir;
 use crate::error::{Error, Result};
-use crate::run::DesiredAds;
+use crate::run::{DesiredAds, DynSource};
 
 const MAX_FRAME: usize = 1024 * 1024;
 
@@ -33,6 +33,7 @@ pub fn default_socket() -> PathBuf {
 pub enum ServiceSource {
     Static,
     DccBus,
+    Microinit,
 }
 
 impl ServiceSource {
@@ -41,6 +42,7 @@ impl ServiceSource {
         match self {
             Self::Static => "static",
             Self::DccBus => "dccBus",
+            Self::Microinit => "microinit",
         }
     }
 }
@@ -102,10 +104,11 @@ pub fn listed_services(ads: &DesiredAds) -> Vec<ListedService> {
         out.push(ListedService::from_entry(svc, ServiceSource::Static));
     }
     for dyn_ad in &ads.dynamic {
-        out.push(ListedService::from_entry(
-            &dyn_ad.entry,
-            ServiceSource::DccBus,
-        ));
+        let source = match dyn_ad.source {
+            DynSource::DccBus => ServiceSource::DccBus,
+            DynSource::Microinit => ServiceSource::Microinit,
+        };
+        out.push(ListedService::from_entry(&dyn_ad.entry, source));
     }
     out
 }

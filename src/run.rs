@@ -1,4 +1,4 @@
-//! Main daemon loop: orchestrates config watch, mDNS, dcc-bus discovery, beacon.
+//! Main daemon loop: orchestrates config watch, mDNS, dcc-bus discovery, microinit watch, beacon.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -17,13 +17,14 @@ use crate::error::Result;
 use crate::iface_watch::{self, IfaceChange};
 use crate::legacy_unicast::{self, AnswerSet, MembershipRefresh};
 use crate::mdns::{self, MdnsPublisher};
+use crate::microinit_watch;
 use crate::signals;
 use crate::sys;
 use crate::version;
 
 /// Shared runtime state updated on config reload.
 struct Shared {
-    config: RwLock<Config>,
+    config: Arc<RwLock<Config>>,
     config_path: PathBuf,
 }
 
@@ -65,10 +66,18 @@ impl FailThrottle {
     }
 }
 
-/// One dynamic DNS-SD registration derived from a running dcc-bus process.
+/// Origin of a dynamic DNS-SD advertisement (not static `services[]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynSource {
+    DccBus,
+    Microinit,
+}
+
+/// One dynamic DNS-SD registration derived from dcc-bus or microinit labels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DynAd {
     pub entry: ServiceEntry,
+    pub source: DynSource,
 }
 
 /// One Z21 LAN discovery beacon (port + virtual serial).
@@ -78,7 +87,8 @@ pub struct BeaconWant {
     pub serial: u32,
 }
 
-/// Desired advertisement set derived from config + loco-server `dcc_bus_list`.
+/// Desired advertisement set derived from config, loco-server `dcc_bus_list`,
+/// and microinit watch snapshots.
 ///
 /// `ips` (IPv4) and `ips_v6` (IPv6) are both included so DHCP / SLAAC privacy
 /// address churn triggers re-registration of A/AAAA via mdns-sd.
@@ -116,8 +126,9 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
         log::warn!("could not install signal handlers: {e}");
     }
 
+    let config = Arc::new(RwLock::new(cfg));
     let shared = Arc::new(Shared {
-        config: RwLock::new(cfg),
+        config: Arc::clone(&config),
         config_path: config_path.to_path_buf(),
     });
 
@@ -131,6 +142,17 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
             (rx, Arc::new(AtomicBool::new(true)))
         }
     };
+    let (microinit_rx, microinit_watch_stop) =
+        match microinit_watch::spawn(Arc::clone(&config), Arc::clone(&stop)) {
+            Ok(pair) => pair,
+            Err(e) => {
+                log::warn!("microinit watcher failed to start: {e}");
+                (
+                    microinit_watch::WatchFeed::disconnected(),
+                    Arc::new(AtomicBool::new(true)),
+                )
+            }
+        };
 
     let publisher = Arc::new(Mutex::new(MdnsPublisher::new()));
     let beacons: Arc<Mutex<Vec<ActiveBeacon>>> = Arc::new(Mutex::new(Vec::new()));
@@ -163,6 +185,7 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
     let mut bigfred_thr = FailThrottle::new();
     let mut last_programs: Option<Vec<Program>> = None;
     let mut next_bigfred_probe = Instant::now();
+    let mut last_microinit: Option<Vec<ServiceEntry>> = None;
 
     let mut last_desired = DesiredAds::default();
     let mut registered: HashMap<String, ServiceEntry> = HashMap::new();
@@ -183,6 +206,10 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
         }
 
         let cfg = shared.config.read().map(|c| c.clone()).unwrap_or_default();
+        drain_microinit(&microinit_rx, &mut last_microinit);
+        if !cfg.microinit.enabled {
+            last_microinit = None;
+        }
         let mdns_ms = cfg.retry.mdns_ms;
 
         // Ensure mDNS daemon (quiet retry). Recreate after suspend so mdns-sd
@@ -204,8 +231,13 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
                 }
                 Err(e) => {
                     mdns_thr.fail("mDNS daemon", &e);
-                    let reason =
-                        sleep_or_iface(&iface_rx, Duration::from_millis(mdns_ms), &mut last_skew);
+                    let reason = sleep_or_iface(
+                        &iface_rx,
+                        &microinit_rx,
+                        &mut last_microinit,
+                        Duration::from_millis(mdns_ms),
+                        &mut last_skew,
+                    );
                     apply_wake(
                         reason,
                         &membership,
@@ -248,11 +280,19 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
         let skip_interfaces = cfg.skip_interfaces;
         {
             let mut hosts = Vec::new();
+            let hostname = version::hostname();
             for svc in &cfg.services {
-                let host =
-                    mdns::normalize_hostname(svc.host.as_deref().unwrap_or(&version::hostname()));
+                let host = mdns::normalize_hostname(svc.host.as_deref().unwrap_or(&hostname));
                 if !hosts.iter().any(|h| h == &host) {
                     hosts.push(host);
+                }
+            }
+            if let Some(entries) = &last_microinit {
+                for svc in entries {
+                    let host = mdns::normalize_hostname(svc.host.as_deref().unwrap_or(&hostname));
+                    if !hosts.iter().any(|h| h == &host) {
+                        hosts.push(host);
+                    }
                 }
             }
             let next = AnswerSet {
@@ -305,17 +345,25 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
                 for p in programs {
                     append_station_ads(&mut desired, p, beacon);
                 }
-                desired.dynamic.sort_by(|a, b| {
-                    (&a.entry.name, &a.entry.type_, a.entry.port).cmp(&(
-                        &b.entry.name,
-                        &b.entry.type_,
-                        b.entry.port,
-                    ))
-                });
-                desired.beacons.sort_unstable();
-                desired.beacons.dedup();
             }
         }
+        if let Some(entries) = &last_microinit {
+            for entry in entries {
+                desired.dynamic.push(DynAd {
+                    entry: entry.clone(),
+                    source: DynSource::Microinit,
+                });
+            }
+        }
+        desired.dynamic.sort_by(|a, b| {
+            (&a.entry.name, &a.entry.type_, a.entry.port).cmp(&(
+                &b.entry.name,
+                &b.entry.type_,
+                b.entry.port,
+            ))
+        });
+        desired.beacons.sort_unstable();
+        desired.beacons.dedup();
 
         if let Ok(mut w) = desired_snapshot.write() {
             *w = desired.clone();
@@ -350,6 +398,8 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
         };
         let reason = sleep_or_iface(
             &iface_rx,
+            &microinit_rx,
+            &mut last_microinit,
             Duration::from_millis(sleep_ms.max(500)),
             &mut last_skew,
         );
@@ -365,6 +415,7 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
     stop.store(true, Ordering::SeqCst);
     watch_stop.store(true, Ordering::SeqCst);
     iface_watch_stop.store(true, Ordering::SeqCst);
+    microinit_watch_stop.store(true, Ordering::SeqCst);
     {
         let mut active = lock_mutex(&beacons);
         for b in active.drain(..) {
@@ -398,6 +449,7 @@ pub fn append_station_ads(desired: &mut DesiredAds, program: &Program, beacon: b
                 layout_name,
                 Some(serial),
             ),
+            source: DynSource::DccBus,
         });
         if beacon {
             desired.beacons.push(BeaconWant {
@@ -419,6 +471,7 @@ pub fn append_station_ads(desired: &mut DesiredAds, program: &Program, beacon: b
                 layout_name,
                 None,
             ),
+            source: DynSource::DccBus,
         });
     }
 }
@@ -611,6 +664,7 @@ pub(crate) enum WakeReason {
     IfaceChange,
     Suspend,
     Shutdown,
+    Microinit,
 }
 
 fn apply_wake(
@@ -637,12 +691,20 @@ fn apply_wake(
             *recreate_daemon = true;
             *force_reannounce = true;
         }
-        WakeReason::Timeout | WakeReason::Shutdown => {}
+        WakeReason::Timeout | WakeReason::Shutdown | WakeReason::Microinit => {}
     }
 }
 
+fn drain_microinit(
+    feed: &microinit_watch::WatchFeed,
+    last: &mut Option<Vec<ServiceEntry>>,
+) -> bool {
+    feed.drain_into(last)
+}
+
 /// Sleep until `total` elapses, shutdown is requested, a netlink iface change
-/// arrives, or CLOCK_BOOTTIME/MONOTONIC skew jumps (suspend/resume).
+/// arrives, a microinit watch snapshot arrives, or CLOCK_BOOTTIME/MONOTONIC
+/// skew jumps (suspend/resume).
 ///
 /// Netlink is polled at [`IFACE_POLL_SLICE`]. Suspend detection is a pair of
 /// `clock_gettime` syscalls, so it runs at most once per
@@ -652,6 +714,8 @@ const SUSPEND_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 fn sleep_or_iface(
     iface_rx: &std::sync::mpsc::Receiver<IfaceChange>,
+    microinit: &microinit_watch::WatchFeed,
+    last_microinit: &mut Option<Vec<ServiceEntry>>,
     total: Duration,
     last_skew: &mut Duration,
 ) -> WakeReason {
@@ -660,6 +724,9 @@ fn sleep_or_iface(
     while Instant::now() < deadline {
         if signals::shutdown_requested() {
             return WakeReason::Shutdown;
+        }
+        if drain_microinit(microinit, last_microinit) {
+            return WakeReason::Microinit;
         }
         let now = Instant::now();
         if now >= next_skew_check {
@@ -693,6 +760,9 @@ fn sleep_or_iface(
     if sys::suspend_detected(*last_skew, now_skew) {
         *last_skew = now_skew;
         return WakeReason::Suspend;
+    }
+    if drain_microinit(microinit, last_microinit) {
+        return WakeReason::Microinit;
     }
     WakeReason::Timeout
 }
@@ -753,16 +823,32 @@ mod tests {
     fn sleep_returns_iface_change() {
         let (tx, rx) = mpsc::sync_channel(1);
         tx.send(IfaceChange).unwrap();
+        let mi_feed = microinit_watch::WatchFeed::disconnected();
+        let mut last_microinit = None;
         let mut last_skew = sys::boottime_monotonic_skew();
-        let reason = sleep_or_iface(&rx, Duration::from_secs(2), &mut last_skew);
+        let reason = sleep_or_iface(
+            &rx,
+            &mi_feed,
+            &mut last_microinit,
+            Duration::from_secs(2),
+            &mut last_skew,
+        );
         assert_eq!(reason, WakeReason::IfaceChange);
     }
 
     #[test]
     fn sleep_times_out_without_signal() {
         let (_tx, rx) = mpsc::sync_channel::<IfaceChange>(1);
+        let mi_feed = microinit_watch::WatchFeed::disconnected();
+        let mut last_microinit = None;
         let mut last_skew = sys::boottime_monotonic_skew();
-        let reason = sleep_or_iface(&rx, Duration::from_millis(50), &mut last_skew);
+        let reason = sleep_or_iface(
+            &rx,
+            &mi_feed,
+            &mut last_microinit,
+            Duration::from_millis(50),
+            &mut last_skew,
+        );
         assert_eq!(reason, WakeReason::Timeout);
     }
 }

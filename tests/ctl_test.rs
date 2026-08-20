@@ -10,7 +10,7 @@ use microdns::ctl::{
     listed_services, print_human, read_frame_from, serve, services_list, write_frame,
     ListedService, ServiceSource, ServicesListBody,
 };
-use microdns::run::{BeaconWant, DesiredAds, DynAd};
+use microdns::run::{BeaconWant, DesiredAds, DynAd, DynSource};
 
 static TMP_SOCK_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -43,6 +43,7 @@ fn sample_ads() -> DesiredAds {
                     host: None,
                     txt: None,
                 },
+                source: DynSource::DccBus,
             },
             DynAd {
                 entry: ServiceEntry {
@@ -53,6 +54,18 @@ fn sample_ads() -> DesiredAds {
                     host: None,
                     txt: None,
                 },
+                source: DynSource::DccBus,
+            },
+            DynAd {
+                entry: ServiceEntry {
+                    name: "bigfred-wizard".into(),
+                    type_: "_http._tcp".into(),
+                    protocol: "tcp".into(),
+                    port: 8091,
+                    host: Some("bigfred".into()),
+                    txt: None,
+                },
+                source: DynSource::Microinit,
             },
         ],
         beacons: vec![BeaconWant {
@@ -66,12 +79,14 @@ fn sample_ads() -> DesiredAds {
 #[test]
 fn listed_services_static_and_dcc_bus_not_beacons() {
     let listed = listed_services(&sample_ads());
-    assert_eq!(listed.len(), 3);
+    assert_eq!(listed.len(), 4);
     assert_eq!(listed[0].source, ServiceSource::Static);
     assert_eq!(listed[0].name, "bigfred");
     assert_eq!(listed[1].source, ServiceSource::DccBus);
     assert_eq!(listed[1].type_, "_withrottle._tcp");
     assert_eq!(listed[2].type_, "_z21._udp");
+    assert_eq!(listed[3].source, ServiceSource::Microinit);
+    assert_eq!(listed[3].name, "bigfred-wizard");
 }
 
 #[test]
@@ -83,6 +98,10 @@ fn source_serializes_camel_case() {
     assert_eq!(
         serde_json::to_value(ServiceSource::DccBus).unwrap(),
         serde_json::json!("dccBus")
+    );
+    assert_eq!(
+        serde_json::to_value(ServiceSource::Microinit).unwrap(),
+        serde_json::json!("microinit")
     );
 }
 
@@ -125,11 +144,12 @@ fn services_list_roundtrip_on_temp_socket() {
     serve(&sock, Arc::clone(&snapshot)).unwrap();
 
     let listed = services_list(&sock).unwrap();
-    assert_eq!(listed.len(), 3);
+    assert_eq!(listed.len(), 4);
     assert_eq!(listed[0].name, "bigfred");
     assert_eq!(listed[0].source, ServiceSource::Static);
     assert_eq!(listed[1].source, ServiceSource::DccBus);
     assert_eq!(listed[2].port, 21105);
+    assert_eq!(listed[3].source, ServiceSource::Microinit);
 
     let err = serve(&sock, snapshot).unwrap_err();
     assert!(err.to_string().contains("already running"));
