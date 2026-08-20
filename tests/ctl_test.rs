@@ -1,6 +1,7 @@
 use std::io::Cursor;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,12 +12,15 @@ use microdns::ctl::{
 };
 use microdns::run::{BeaconWant, DesiredAds, DynAd};
 
+static TMP_SOCK_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn tmp_sock() -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("microdns-ctl-{nanos}.sock"))
+    let seq = TMP_SOCK_SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("microdns-ctl-{nanos}-{seq}.sock"))
 }
 
 fn sample_ads() -> DesiredAds {
