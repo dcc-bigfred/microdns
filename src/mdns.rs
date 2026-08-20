@@ -448,6 +448,7 @@ fn addrs_for_iface(name: &str) -> (Vec<(Ipv4Addr, Ipv4Addr)>, Vec<Ipv6Addr>) {
 ///
 /// TXT: `layoutId`, `commandStationId`, `proto`, optional `layoutName`, and for
 /// Z21 also `serial`.
+#[allow(clippy::too_many_arguments)]
 pub fn dcc_service_entry(
     instance: &str,
     type_: &str,
