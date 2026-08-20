@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use microdns::legacy_unicast::{
     build_response, choose_v4, choose_v4_for_iface, choose_v6_for_iface, hosts_match, parse_query,
-    spawn, AnswerSet, IfaceAddr4, IfaceAddr6, ParsedQuery, LEGACY_TTL, QTYPE_A, QTYPE_AAAA,
-    QTYPE_ANY,
+    spawn, AnswerSet, IfaceAddr4, IfaceAddr6, MembershipRefresh, ParsedQuery, LEGACY_TTL, QTYPE_A,
+    QTYPE_AAAA, QTYPE_ANY,
 };
 
 fn encode_name(name: &str) -> Vec<u8> {
@@ -343,4 +343,24 @@ fn spawn_echoes_transaction_id_on_ephemeral_port() {
     pos += 1 + 4; // root + type/class
     let ttl = u32::from_be_bytes([resp[pos], resp[pos + 1], resp[pos + 2], resp[pos + 3]]);
     assert_eq!(ttl, LEGACY_TTL);
+}
+
+#[test]
+fn membership_refresh_rejoin_does_not_rebind() {
+    let r = MembershipRefresh::new();
+    assert_eq!(r.epoch(), 0);
+    r.request_rejoin();
+    assert_eq!(r.epoch(), 1);
+    assert!(!r.take_rebind());
+    r.request_rejoin();
+    assert_eq!(r.epoch(), 2);
+}
+
+#[test]
+fn membership_refresh_rebind_sets_flag_and_epoch() {
+    let r = MembershipRefresh::new();
+    r.request_rebind();
+    assert_eq!(r.epoch(), 1);
+    assert!(r.take_rebind());
+    assert!(!r.take_rebind());
 }

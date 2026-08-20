@@ -1,6 +1,6 @@
 //! mDNS/DNS-SD registration via the `mdns-sd` crate.
 //!
-//! Skips docker/veth/br-* interfaces; prefers UP non-loopback addresses.
+//! Skips docker/veth/br-* interfaces; prefers RUNNING non-loopback addresses.
 //! Hostnames are advertised without a leading FQDN — we append `.local.`.
 
 use std::collections::{HashMap, HashSet};
@@ -152,6 +152,16 @@ impl MdnsPublisher {
             set.clear();
         }
     }
+
+    /// Drop the current `ServiceDaemon` and start a new one.
+    ///
+    /// Needed after suspend/resume: mdns-sd only rejoins multicast when the IP
+    /// set changes, so the old sockets keep a stale NIC filter. A new daemon
+    /// binds fresh UDP sockets and joins `224.0.0.251` from scratch.
+    pub fn recreate_daemon(&mut self) -> Result<()> {
+        self.shutdown();
+        self.ensure_daemon()
+    }
 }
 
 impl Default for MdnsPublisher {
@@ -186,7 +196,7 @@ pub fn normalize_hostname(host: &str) -> String {
     format!("{bare}.local.")
 }
 
-/// Collect preferred IPv4 addresses: UP, non-loopback, allowlisted, not skipped.
+/// Collect preferred IPv4 addresses: running, non-loopback, allowlisted, not skipped.
 #[must_use]
 pub fn preferred_ipv4_addrs(allow: &[String], skip: &[String]) -> Vec<Ipv4Addr> {
     preferred_ipv4_ifaces(allow, skip)
@@ -279,6 +289,16 @@ fn iface_usable(iface: &IfaceInfo, allow: &[String], skip: &[String]) -> bool {
     true
 }
 
+/// Whether the link is usable for mDNS: `IFF_RUNNING` or `operstate == "up"`.
+///
+/// `IFF_UP` alone is not enough — after suspend a Wi‑Fi NIC often stays
+/// administratively up (`IFF_UP`) with `operstate=dormant` and a stale DHCP
+/// address. Treating that as live skips the multicast rejoin.
+#[must_use]
+pub fn iface_link_ready(flags_val: u32, operstate: &str) -> bool {
+    (flags_val & libc::IFF_RUNNING as u32) != 0 || operstate.eq_ignore_ascii_case("up")
+}
+
 fn is_ipv6_link_local(ip: &Ipv6Addr) -> bool {
     let octets = ip.octets();
     octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80
@@ -360,9 +380,9 @@ fn list_interfaces() -> Result<Vec<IfaceInfo>> {
             .to_string();
         let flags = fs::read_to_string(entry.path().join("flags")).unwrap_or_default();
         let flags_val = u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16).unwrap_or(0);
-        // IFF_UP=0x1, IFF_LOOPBACK=0x8
-        let is_up = (flags_val & 0x1) != 0 || operstate == "up";
-        let is_loopback = (flags_val & 0x8) != 0 || name == "lo";
+        // IFF_RUNNING (carrier) or operstate=up — not IFF_UP alone (see iface_link_ready).
+        let is_up = iface_link_ready(flags_val, &operstate);
+        let is_loopback = (flags_val & libc::IFF_LOOPBACK as u32) != 0 || name == "lo";
         let ifindex = fs::read_to_string(entry.path().join("ifindex"))
             .ok()
             .and_then(|s| s.trim().parse().ok())
@@ -426,8 +446,9 @@ fn addrs_for_iface(name: &str) -> (Vec<(Ipv4Addr, Ipv4Addr)>, Vec<Ipv6Addr>) {
 
 /// Helper to register a dynamic dcc-bus service (`_z21._udp` / `_withrottle._tcp`).
 ///
-/// TXT mirrors the former in-process discovery sidecar: `layoutId`,
-/// `commandStationId`, `proto`, and for Z21 also `serial`.
+/// TXT: `layoutId`, `commandStationId`, `proto`, optional `layoutName`, and for
+/// Z21 also `serial`.
+#[allow(clippy::too_many_arguments)]
 pub fn dcc_service_entry(
     instance: &str,
     type_: &str,
@@ -435,12 +456,16 @@ pub fn dcc_service_entry(
     port: u16,
     layout_id: u32,
     command_station_id: u32,
+    layout_name: &str,
     serial: Option<u32>,
 ) -> ServiceEntry {
     let mut txt = HashMap::new();
     txt.insert("proto".into(), protocol.into());
     txt.insert("layoutId".into(), layout_id.to_string());
     txt.insert("commandStationId".into(), command_station_id.to_string());
+    if !layout_name.is_empty() {
+        txt.insert("layoutName".into(), layout_name.into());
+    }
     if let Some(serial) = serial {
         txt.insert("serial".into(), serial.to_string());
     }

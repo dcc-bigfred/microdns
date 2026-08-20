@@ -7,9 +7,16 @@ use std::io::{ErrorKind, IoSliceMut};
 use std::mem::{self, MaybeUninit};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::Once;
 use std::time::Duration;
 
 use socket2::{SockAddr, SockAddrStorage, Socket};
+
+/// Minimum jump in `CLOCK_BOOTTIME − CLOCK_MONOTONIC` treated as suspend/resume.
+/// Monotonic pauses during sleep; boottime does not, so the skew jumps by the
+/// sleep duration. 2 s is well above scheduling noise and well below a real
+/// suspend.
+pub const SUSPEND_SKEW_THRESHOLD: Duration = Duration::from_secs(2);
 
 const CMSG_BUF: usize = 256;
 
@@ -244,4 +251,50 @@ unsafe fn parse_pktinfo_ifindex(msg: &libc::msghdr, is_v6: bool) -> Option<u32> 
         cmsg = unsafe { libc::CMSG_NXTHDR(msg, cmsg) };
     }
     None
+}
+
+fn clock_gettime_duration(clock_id: libc::clockid_t) -> std::io::Result<Duration> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid timespec; clock_gettime writes it and does not
+    // retain the pointer. `clock_id` is a kernel clock constant.
+    let rc = unsafe { libc::clock_gettime(clock_id, &mut ts) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // CLOCK_BOOTTIME / CLOCK_MONOTONIC are non-negative from boot; a negative
+    // tv_sec is not reachable in practice, so saturating to zero is fine.
+    let sec = u64::try_from(ts.tv_sec).unwrap_or(0);
+    let nsec = u32::try_from(ts.tv_nsec).unwrap_or(0);
+    Ok(Duration::new(sec, nsec))
+}
+
+/// Accumulated suspend time: `CLOCK_BOOTTIME − CLOCK_MONOTONIC`.
+///
+/// Both clocks advance together while running; only boottime includes sleep.
+/// After resume the difference jumps by (approximately) the sleep duration.
+#[must_use]
+pub fn boottime_monotonic_skew() -> Duration {
+    match (
+        clock_gettime_duration(libc::CLOCK_BOOTTIME),
+        clock_gettime_duration(libc::CLOCK_MONOTONIC),
+    ) {
+        (Ok(boot), Ok(mono)) => boot.saturating_sub(mono),
+        (Err(e), _) | (_, Err(e)) => {
+            static WARN: Once = Once::new();
+            WARN.call_once(|| {
+                log::warn!("clock_gettime failed; suspend detection disabled: {e}");
+            });
+            Duration::ZERO
+        }
+    }
+}
+
+/// True when the boottime/monotonic skew jumped by at least
+/// [`SUSPEND_SKEW_THRESHOLD`] — the process was frozen across suspend.
+#[must_use]
+pub fn suspend_detected(prev_skew: Duration, now_skew: Duration) -> bool {
+    now_skew.saturating_sub(prev_skew) >= SUSPEND_SKEW_THRESHOLD
 }

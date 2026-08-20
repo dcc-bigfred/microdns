@@ -15,10 +15,42 @@ pub fn default_config_path() -> PathBuf {
     datadir::path(["etc", "microdns.json"])
 }
 
-/// microinit control socket under the data root.
+/// BigFred loco-server control socket under the data root.
 #[must_use]
-pub fn default_microinit_socket() -> PathBuf {
-    datadir::path(["run", "microinit.sock"])
+pub fn default_bigfred_socket() -> PathBuf {
+    datadir::path(["run", "bigfred.sock"])
+}
+
+/// Poll loco-server for dcc-bus programs and advertise their ports.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BigFredConfig {
+    /// Feature toggle; default **true** when the key is absent.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Override socket path. Empty / omitted → `$DATA_DIR/run/bigfred.sock`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<String>,
+}
+
+impl Default for BigFredConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            socket: None,
+        }
+    }
+}
+
+impl BigFredConfig {
+    /// Resolved control-socket path.
+    #[must_use]
+    pub fn socket_path(&self) -> PathBuf {
+        match &self.socket {
+            Some(s) if !s.trim().is_empty() => PathBuf::from(s),
+            _ => default_bigfred_socket(),
+        }
+    }
 }
 
 /// One static DNS-SD service entry.
@@ -41,41 +73,20 @@ pub struct ServiceEntry {
     pub txt: Option<HashMap<String, String>>,
 }
 
-/// Optional dcc-bus discovery / advertisement.
+/// Z21 LAN serial broadcast when a `_z21._udp` port is advertised.
+/// Extra keys in existing JSON (`enabled`, port guesses) are ignored.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DccBusConfig {
-    /// Feature toggle; when false only static `services[]` are advertised.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Expected Z21 UDP listen port.
-    #[serde(default = "default_z21_port")]
-    pub z21_port: u16,
-    /// Expected WiThrottle TCP listen port.
-    #[serde(default = "default_withrottle_port")]
-    pub withrottle_port: u16,
-    /// Broadcast LAN_GET_SERIAL_NUMBER reply when Z21 port is listening.
+    /// Broadcast LAN_GET_SERIAL_NUMBER reply when a Z21 port is advertised.
     #[serde(default = "default_true")]
     pub beacon: bool,
 }
 
 impl Default for DccBusConfig {
     fn default() -> Self {
-        Self {
-            enabled: false,
-            z21_port: default_z21_port(),
-            withrottle_port: default_withrottle_port(),
-            beacon: true,
-        }
+        Self { beacon: true }
     }
-}
-
-fn default_z21_port() -> u16 {
-    21105
-}
-
-fn default_withrottle_port() -> u16 {
-    12090
 }
 
 fn default_true() -> bool {
@@ -86,38 +97,41 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RetryConfig {
-    #[serde(default = "default_microinit_ms")]
-    pub microinit_ms: u64,
-    #[serde(default = "default_proc_ms")]
-    pub proc_ms: u64,
+    /// Poll interval while the BigFred socket is answering (milliseconds).
+    /// `microinitMs` is accepted as an alias for existing JSON files.
+    #[serde(default = "default_poll_ms", alias = "microinitMs")]
+    pub poll_ms: u64,
     #[serde(default = "default_mdns_ms")]
     pub mdns_ms: u64,
     #[serde(default = "default_iface_ms")]
     pub iface_ms: u64,
+    /// Retry interval when the BigFred socket is missing (milliseconds).
+    #[serde(default = "default_bigfred_ms")]
+    pub bigfred_ms: u64,
 }
 
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            microinit_ms: default_microinit_ms(),
-            proc_ms: default_proc_ms(),
+            poll_ms: default_poll_ms(),
             mdns_ms: default_mdns_ms(),
             iface_ms: default_iface_ms(),
+            bigfred_ms: default_bigfred_ms(),
         }
     }
 }
 
-fn default_microinit_ms() -> u64 {
-    2000
-}
-fn default_proc_ms() -> u64 {
-    2000
+fn default_poll_ms() -> u64 {
+    45_000
 }
 fn default_mdns_ms() -> u64 {
     3000
 }
 fn default_iface_ms() -> u64 {
     5000
+}
+fn default_bigfred_ms() -> u64 {
+    45_000
 }
 
 /// Top-level microdns configuration.
@@ -126,6 +140,8 @@ fn default_iface_ms() -> u64 {
 pub struct Config {
     #[serde(default)]
     pub services: Vec<ServiceEntry>,
+    #[serde(default)]
+    pub bigfred: BigFredConfig,
     #[serde(default)]
     pub dcc_bus: DccBusConfig,
     #[serde(default)]
@@ -157,6 +173,7 @@ impl Default for Config {
                 host: Some("bigfred".into()),
                 txt: Some(HashMap::from([("path".into(), "/".into())])),
             }],
+            bigfred: BigFredConfig::default(),
             dcc_bus: DccBusConfig::default(),
             retry: RetryConfig::default(),
             skip_interfaces: Vec::new(),
@@ -185,16 +202,6 @@ impl Config {
                     "service '{}': port must be non-zero",
                     svc.name
                 )));
-            }
-        }
-        if self.dcc_bus.enabled {
-            if self.dcc_bus.z21_port == 0 {
-                return Err(Error::Config("dccBus.z21Port must be non-zero".into()));
-            }
-            if self.dcc_bus.withrottle_port == 0 {
-                return Err(Error::Config(
-                    "dccBus.withrottlePort must be non-zero".into(),
-                ));
             }
         }
         validate_iface_prefixes("skipInterfaces", &self.skip_interfaces)?;

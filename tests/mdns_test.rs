@@ -1,6 +1,6 @@
 use microdns::mdns::{
-    dcc_service_entry, is_allowed_iface, normalize_hostname, normalize_service_type,
-    should_skip_iface,
+    dcc_service_entry, iface_link_ready, is_allowed_iface, normalize_hostname,
+    normalize_service_type, should_skip_iface,
 };
 
 #[test]
@@ -61,11 +61,40 @@ fn allowlist_prefix_match() {
 }
 
 #[test]
+fn link_ready_requires_running_or_operstate_up() {
+    // IFF_UP alone after suspend is not a live link.
+    assert!(!iface_link_ready(libc::IFF_UP as u32, "down"));
+    assert!(!iface_link_ready(libc::IFF_UP as u32, "dormant"));
+    assert!(!iface_link_ready(libc::IFF_UP as u32, "unknown"));
+    // IFF_RUNNING is sufficient even if operstate is unknown (dummy).
+    assert!(iface_link_ready(libc::IFF_RUNNING as u32, "unknown"));
+    assert!(iface_link_ready(
+        (libc::IFF_UP | libc::IFF_RUNNING) as u32,
+        "down"
+    ));
+    // operstate=up covers drivers that omit IFF_RUNNING.
+    assert!(iface_link_ready(libc::IFF_UP as u32, "up"));
+    assert!(iface_link_ready(0, "up"));
+    assert!(iface_link_ready(0, "UP"));
+    assert!(!iface_link_ready(0, "down"));
+}
+
+#[test]
 fn dcc_entry_has_proto_txt() {
-    let e = dcc_service_entry("hub1", "_z21._udp", "udp", 21105, 2, 5, Some(258_002_005));
+    let e = dcc_service_entry(
+        "hub1",
+        "_z21._udp",
+        "udp",
+        21105,
+        2,
+        5,
+        "Klubowa",
+        Some(258_002_005),
+    );
     let txt = e.txt.as_ref().unwrap();
     assert_eq!(txt.get("proto").unwrap(), "udp");
     assert_eq!(txt.get("layoutId").unwrap(), "2");
     assert_eq!(txt.get("commandStationId").unwrap(), "5");
+    assert_eq!(txt.get("layoutName").unwrap(), "Klubowa");
     assert_eq!(txt.get("serial").unwrap(), "258002005");
 }
