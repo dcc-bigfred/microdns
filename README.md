@@ -61,7 +61,7 @@ Default path: `$DATA_DIR/etc/microdns.json`. Created with defaults if missing.
   },
   "retry": {
     "bigfredMs": 45000,
-    "pollMs": 45000,
+    "pollMs": 25000,
     "mdnsMs": 3000,
     "ifaceMs": 5000,
     "microinitReconnectMs": 3000
@@ -77,7 +77,7 @@ Default path: `$DATA_DIR/etc/microdns.json`. Created with defaults if missing.
   Set `false` if this host has no microinit socket.
 - `dccBus.beacon` (default `true`): Z21 LAN serial broadcast on advertised UDP ports.
 - `retry.bigfredMs` (default `45000`): wait between probes while the socket is down.
-  `retry.pollMs` (default `45000`) is the poll interval once connected.
+  `retry.pollMs` (default `25000`) is the poll interval once connected.
   Existing files may still use `retry.microinitMs`; that alias still maps to
   `pollMs` (BigFred), **not** the microinit watch. Use `retry.microinitReconnectMs`
   for watch reconnect backoff.

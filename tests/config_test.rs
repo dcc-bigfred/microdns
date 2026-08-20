@@ -53,7 +53,7 @@ fn default_roundtrip() {
     assert!(back.dcc_bus.beacon);
     assert!(back.bigfred.enabled);
     assert!(back.microinit.enabled);
-    assert_eq!(back.retry.poll_ms, 45_000);
+    assert_eq!(back.retry.poll_ms, 25_000);
     assert_eq!(back.retry.mdns_ms, 3000);
     assert_eq!(back.retry.bigfred_ms, 45_000);
     assert_eq!(back.retry.microinit_reconnect_ms, 3000);
