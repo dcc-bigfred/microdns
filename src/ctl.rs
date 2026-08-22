@@ -4,11 +4,12 @@
 //! Request `{ "type": "services_list" }` returns the current DesiredAds snapshot
 //! (static `services[]` plus dynamic dcc-bus / microinit DNS-SD; not Z21 LAN beacons).
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -17,9 +18,18 @@ use serde::{Deserialize, Serialize};
 use crate::config::ServiceEntry;
 use crate::datadir;
 use crate::error::{Error, Result};
+use crate::mdns::MdnsPublisher;
 use crate::run::{DesiredAds, DynSource};
+use crate::selfcheck;
 
 const MAX_FRAME: usize = 1024 * 1024;
+
+/// Live daemon handles the ctl `doctor` request can read.
+#[derive(Clone)]
+pub struct CtlRuntime {
+    pub publisher: Arc<Mutex<MdnsPublisher>>,
+    pub selfcheck: Arc<RwLock<selfcheck::Report>>,
+}
 
 /// Default control socket under the data root.
 #[must_use]
@@ -92,6 +102,17 @@ struct Request {
 #[derive(Debug, Serialize, Deserialize)]
 struct ErrorBody {
     error: String,
+}
+
+/// Live-daemon slice of a doctor report (ctl `doctor` response).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonDoctor {
+    pub services: Vec<ListedService>,
+    pub registered: Vec<String>,
+    pub metrics: HashMap<String, i64>,
+    pub last_announce_secs_ago: HashMap<String, u64>,
+    pub selfcheck: selfcheck::Report,
 }
 
 /// Flatten the current desired advertisement set for the ctl API.
@@ -203,6 +224,15 @@ fn apply_socket_perms(socket_path: &Path) -> Result<()> {
 /// Bind `$DATA_DIR/run/microdns.sock` (or `path`) and serve `services_list` in a
 /// background accept thread. Snapshot is read on each request.
 pub fn serve(path: &Path, snapshot: Arc<RwLock<DesiredAds>>) -> Result<()> {
+    serve_with_runtime(path, snapshot, None)
+}
+
+/// Like [`serve`], with optional live publisher / selfcheck for `doctor`.
+pub fn serve_with_runtime(
+    path: &Path,
+    snapshot: Arc<RwLock<DesiredAds>>,
+    runtime: Option<CtlRuntime>,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| Error::io_at(parent, e))?;
@@ -220,7 +250,8 @@ pub fn serve(path: &Path, snapshot: Arc<RwLock<DesiredAds>>) -> Result<()> {
                 match conn {
                     Ok(stream) => {
                         let snap = Arc::clone(&snapshot);
-                        thread::spawn(move || handle_conn(stream, snap));
+                        let rt = runtime.clone();
+                        thread::spawn(move || handle_conn(stream, snap, rt));
                     }
                     Err(_) => {
                         if !path.exists() {
@@ -234,7 +265,11 @@ pub fn serve(path: &Path, snapshot: Arc<RwLock<DesiredAds>>) -> Result<()> {
     Ok(())
 }
 
-fn handle_conn(mut stream: UnixStream, snapshot: Arc<RwLock<DesiredAds>>) {
+fn handle_conn(
+    mut stream: UnixStream,
+    snapshot: Arc<RwLock<DesiredAds>>,
+    runtime: Option<CtlRuntime>,
+) {
     let raw = match read_frame(&mut stream) {
         Ok(b) => b,
         Err(_) => return,
@@ -251,31 +286,88 @@ fn handle_conn(mut stream: UnixStream, snapshot: Arc<RwLock<DesiredAds>>) {
             return;
         }
     };
-    if req.type_ != "services_list" {
-        let _ = write_frame(
-            &mut stream,
-            &ErrorBody {
-                error: "invalid_request".into(),
-            },
-        );
-        return;
-    }
-    let ads = match snapshot.read() {
-        Ok(g) => g.clone(),
-        Err(_) => {
+    match req.type_.as_str() {
+        "services_list" => {
+            let ads = match snapshot.read() {
+                Ok(g) => g.clone(),
+                Err(_) => {
+                    let _ = write_frame(
+                        &mut stream,
+                        &ErrorBody {
+                            error: "internal_error".into(),
+                        },
+                    );
+                    return;
+                }
+            };
+            let body = ServicesListBody {
+                services: listed_services(&ads),
+            };
+            let _ = write_frame(&mut stream, &body);
+        }
+        "doctor" => {
+            let body = match build_daemon_doctor(&snapshot, runtime.as_ref()) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = write_frame(
+                        &mut stream,
+                        &ErrorBody {
+                            error: e.to_string(),
+                        },
+                    );
+                    return;
+                }
+            };
+            let _ = write_frame(&mut stream, &body);
+        }
+        _ => {
             let _ = write_frame(
                 &mut stream,
                 &ErrorBody {
-                    error: "internal_error".into(),
+                    error: "invalid_request".into(),
                 },
             );
-            return;
         }
+    }
+}
+
+fn build_daemon_doctor(
+    snapshot: &RwLock<DesiredAds>,
+    runtime: Option<&CtlRuntime>,
+) -> Result<DaemonDoctor> {
+    let ads = snapshot
+        .read()
+        .map(|g| g.clone())
+        .map_err(|_| Error::Ipc("internal_error".into()))?;
+    let services = listed_services(&ads);
+    let (registered, metrics, last_announce_secs_ago) = if let Some(rt) = runtime {
+        let pub_guard = match rt.publisher.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let now = std::time::Instant::now();
+        let last: HashMap<String, u64> = pub_guard
+            .announce_log()
+            .snapshot()
+            .into_iter()
+            .map(|(k, at)| (k, now.saturating_duration_since(at).as_secs()))
+            .collect();
+        let mut names: Vec<String> = pub_guard.registered_names().into_iter().collect();
+        names.sort();
+        (names, pub_guard.metrics(), last)
+    } else {
+        (Vec::new(), HashMap::new(), HashMap::new())
     };
-    let body = ServicesListBody {
-        services: listed_services(&ads),
-    };
-    let _ = write_frame(&mut stream, &body);
+    let selfcheck = runtime
+        .and_then(|rt| rt.selfcheck.read().ok().map(|g| g.clone()))
+        .unwrap_or_default();
+    Ok(DaemonDoctor {
+        services,
+        registered,
+        metrics,
+        last_announce_secs_ago,
+        selfcheck,
+    })
 }
 
 fn connect(socket_path: &Path) -> Result<UnixStream> {
@@ -305,6 +397,17 @@ pub fn services_list(socket_path: &Path) -> Result<Vec<ListedService>> {
     }
     let body: ServicesListBody = serde_json::from_slice(&raw)?;
     Ok(body.services)
+}
+
+/// Query a live daemon for a doctor snapshot (metrics, selfcheck, registered names).
+pub fn doctor(socket_path: &Path) -> Result<DaemonDoctor> {
+    let raw = request_raw(socket_path, &serde_json::json!({"type": "doctor"}))?;
+    if let Ok(err) = serde_json::from_slice::<ErrorBody>(&raw) {
+        if !err.error.is_empty() {
+            return Err(Error::Ipc(err.error));
+        }
+    }
+    Ok(serde_json::from_slice(&raw)?)
 }
 
 /// Human table: NAME, TYPE, PROTO, PORT, HOST, SOURCE (tabwriter-style).

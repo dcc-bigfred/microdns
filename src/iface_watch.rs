@@ -1,11 +1,15 @@
 //! Linux rtnetlink watcher for interface / address churn.
 //!
 //! Subscribes to `RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR` and
-//! signals [`IfaceChange`] whenever anything readable arrives. Payload parsing
-//! is intentionally skipped — the main loop re-scans interfaces on each signal
-//! and always force-rejoins multicast, even when the address set is unchanged
-//! (suspend/resume, link down/up with the same IP). Polling remains the
-//! fallback when netlink is unavailable.
+//! signals [`IfaceChange`] when a **relevant** interface (allow/skip filtered)
+//! changes. Loopback, docker/veth/br-*, and configured skip prefixes are
+//! ignored so a wireless-programmer job on `wlan0` does not re-announce
+//! Ethernet mDNS. Events are debounced ([`DEBOUNCE`]) so a burst (DHCP, link
+//! flap) becomes one signal.
+//!
+//! Payload parsing extracts the interface name / ifindex; the main loop still
+//! re-scans addresses on each signal. Polling remains the fallback when
+//! netlink is unavailable.
 //!
 //! The signal channel is bounded ([`IFACE_CHANGE_CAPACITY`]). Overflow drops
 //! events: the signal is idempotent ("something changed"), so losing duplicates
@@ -14,26 +18,43 @@
 use std::io::ErrorKind;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::mdns;
 use crate::sys;
 
 const BIND_RETRY: Duration = Duration::from_secs(3);
 const RECV_TIMEOUT: Duration = Duration::from_millis(500);
+/// Coalesce a burst of netlink events into one signal.
+pub(crate) const DEBOUNCE: Duration = Duration::from_millis(400);
 
 /// Bound on coalesced iface-change signals waiting for the main loop.
 pub(crate) const IFACE_CHANGE_CAPACITY: usize = 32;
 
-/// Signal that interface or address state may have changed.
+const NLMSG_HDRLEN: usize = 16;
+const IFINFOMSG_LEN: usize = 16;
+const IFADDRMSG_LEN: usize = 8;
+const RTA_HDRLEN: usize = 4;
+
+/// Signal that interface or address state may have changed on a used NIC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IfaceChange;
 
 /// Spawn a netlink watcher thread. Returns a receiver of change signals and a
 /// stop flag. Bind failures are retried quietly; they never crash the daemon.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn spawn() -> Result<(Receiver<IfaceChange>, Arc<AtomicBool>)> {
+    spawn_filtered(Arc::new(RwLock::new(Config::default())))
+}
+
+/// Like [`spawn`], with a live config so skip/allow lists apply after reload.
+pub(crate) fn spawn_filtered(
+    config: Arc<RwLock<Config>>,
+) -> Result<(Receiver<IfaceChange>, Arc<AtomicBool>)> {
     let (tx, rx) = mpsc::sync_channel(IFACE_CHANGE_CAPACITY);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thr = Arc::clone(&stop);
@@ -41,7 +62,7 @@ pub(crate) fn spawn() -> Result<(Receiver<IfaceChange>, Arc<AtomicBool>)> {
     thread::Builder::new()
         .name("iface-watch".into())
         .spawn(move || {
-            if let Err(e) = watch_loop(tx, stop_thr) {
+            if let Err(e) = watch_loop(tx, stop_thr, config) {
                 log::warn!("iface watcher stopped: {e}");
             }
         })
@@ -50,7 +71,11 @@ pub(crate) fn spawn() -> Result<(Receiver<IfaceChange>, Arc<AtomicBool>)> {
     Ok((rx, stop))
 }
 
-fn watch_loop(tx: SyncSender<IfaceChange>, stop: Arc<AtomicBool>) -> Result<()> {
+fn watch_loop(
+    tx: SyncSender<IfaceChange>,
+    stop: Arc<AtomicBool>,
+    config: Arc<RwLock<Config>>,
+) -> Result<()> {
     let mut warned_bind = false;
 
     while !stop.load(Ordering::SeqCst) {
@@ -78,24 +103,143 @@ fn watch_loop(tx: SyncSender<IfaceChange>, stop: Arc<AtomicBool>) -> Result<()> 
             }
         };
 
+        let mut pending = false;
+        let mut deadline = Instant::now();
+
         while !stop.load(Ordering::SeqCst) {
-            match sys::recv_netlink_any(&sock) {
-                Ok(true) => match tx.try_send(IfaceChange) {
-                    Ok(()) => {}
-                    // Full: at least one change is already queued; drop extras.
-                    Err(TrySendError::Full(_)) => {}
-                    Err(TrySendError::Disconnected(_)) => return Ok(()),
-                },
-                Ok(false) => {} // timeout
+            let mut buf = [0u8; 8192];
+            match sys::recv_netlink(&sock, &mut buf) {
+                Ok(0) => {}
+                Ok(n) => {
+                    let (allow, skip) = config
+                        .read()
+                        .map(|c| (c.interfaces.clone(), c.skip_interfaces.clone()))
+                        .unwrap_or_default();
+                    if netlink_is_relevant(&buf[..n], &allow, &skip) {
+                        pending = true;
+                        deadline = Instant::now() + DEBOUNCE;
+                    }
+                }
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
                 Err(e) => {
                     log::warn!("iface watcher: recv failed: {e}; rebinding");
                     break;
                 }
             }
+
+            if pending && Instant::now() >= deadline {
+                loop {
+                    buf = [0u8; 8192];
+                    match sys::recv_netlink(&sock, &mut buf) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                pending = false;
+                match tx.try_send(IfaceChange) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {}
+                    Err(TrySendError::Disconnected(_)) => return Ok(()),
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// True when `buf` contains a link/addr event for an interface we advertise on.
+#[must_use]
+pub(crate) fn netlink_is_relevant(buf: &[u8], allow: &[String], skip: &[String]) -> bool {
+    for (ifindex, name) in parse_netlink_ifaces(buf) {
+        let resolved = if name.is_empty() {
+            name_for_ifindex(ifindex).unwrap_or_default()
+        } else {
+            name
+        };
+        if resolved.is_empty() {
+            // Unknown name: let the main loop re-scan rather than drop the event.
+            return true;
+        }
+        if mdns::iface_name_relevant(&resolved, allow, skip) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Parse interface index + name from a netlink route dump / event buffer.
+#[must_use]
+pub(crate) fn parse_netlink_ifaces(buf: &[u8]) -> Vec<(u32, String)> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + NLMSG_HDRLEN <= buf.len() {
+        let len = u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap_or([0; 4])) as usize;
+        if len < NLMSG_HDRLEN || off + len > buf.len() {
+            break;
+        }
+        let nlmsg_type = u16::from_ne_bytes(buf[off + 4..off + 6].try_into().unwrap_or([0; 2]));
+        let payload = &buf[off + NLMSG_HDRLEN..off + len];
+        match nlmsg_type {
+            libc::RTM_NEWLINK | libc::RTM_DELLINK | libc::RTM_GETLINK
+                if payload.len() >= IFINFOMSG_LEN =>
+            {
+                let ifindex =
+                    i32::from_ne_bytes(payload[4..8].try_into().unwrap_or([0; 4])) as u32;
+                let name =
+                    rta_str(&payload[IFINFOMSG_LEN..], libc::IFLA_IFNAME).unwrap_or_default();
+                if ifindex != 0 {
+                    out.push((ifindex, name));
+                }
+            }
+            libc::RTM_NEWADDR | libc::RTM_DELADDR if payload.len() >= IFADDRMSG_LEN => {
+                let ifindex = u32::from_ne_bytes(payload[4..8].try_into().unwrap_or([0; 4]));
+                let name =
+                    rta_str(&payload[IFADDRMSG_LEN..], libc::IFA_LABEL).unwrap_or_default();
+                if ifindex != 0 {
+                    out.push((ifindex, name));
+                }
+            }
+            _ => {}
+        }
+        off += align4(len);
+    }
+    out
+}
+
+fn rta_str(attrs: &[u8], want: u16) -> Option<String> {
+    let mut off = 0usize;
+    while off + RTA_HDRLEN <= attrs.len() {
+        let rta_len = u16::from_ne_bytes(attrs[off..off + 2].try_into().ok()?) as usize;
+        let rta_type = u16::from_ne_bytes(attrs[off + 2..off + 4].try_into().ok()?);
+        if rta_len < RTA_HDRLEN || off + rta_len > attrs.len() {
+            break;
+        }
+        if rta_type == want {
+            let data = &attrs[off + RTA_HDRLEN..off + rta_len];
+            let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+            return String::from_utf8(data[..end].to_vec()).ok();
+        }
+        off += align4(rta_len);
+    }
+    None
+}
+
+fn align4(n: usize) -> usize {
+    n.saturating_add(3) & !3
+}
+
+fn name_for_ifindex(ifindex: u32) -> Option<String> {
+    let entries = std::fs::read_dir("/sys/class/net").ok()?;
+    for entry in entries.flatten() {
+        let Ok(idx) = std::fs::read_to_string(entry.path().join("ifindex")) else {
+            continue;
+        };
+        if idx.trim().parse::<u32>().ok() == Some(ifindex) {
+            return Some(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    None
 }
 
 /// Drain any pending iface-change signals (for tests / main-loop coalescing).
@@ -118,6 +262,103 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    fn encode_rta(typ: u16, data: &[u8]) -> Vec<u8> {
+        let rta_len = RTA_HDRLEN + data.len();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(rta_len as u16).to_ne_bytes());
+        out.extend_from_slice(&typ.to_ne_bytes());
+        out.extend_from_slice(data);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        out
+    }
+
+    fn encode_nlmsg(nlmsg_type: u16, payload: &[u8]) -> Vec<u8> {
+        let len = NLMSG_HDRLEN + payload.len();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(len as u32).to_ne_bytes());
+        out.extend_from_slice(&nlmsg_type.to_ne_bytes());
+        out.extend_from_slice(&0u16.to_ne_bytes()); // flags
+        out.extend_from_slice(&0u32.to_ne_bytes()); // seq
+        out.extend_from_slice(&0u32.to_ne_bytes()); // pid
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn ifinfomsg(ifindex: i32) -> Vec<u8> {
+        let mut p = vec![0u8; IFINFOMSG_LEN];
+        p[4..8].copy_from_slice(&ifindex.to_ne_bytes());
+        p
+    }
+
+    fn ifaddrmsg(ifindex: u32) -> Vec<u8> {
+        let mut p = vec![0u8; IFADDRMSG_LEN];
+        p[4..8].copy_from_slice(&ifindex.to_ne_bytes());
+        p
+    }
+
+    fn link_event(ifindex: i32, name: &str) -> Vec<u8> {
+        let mut payload = ifinfomsg(ifindex);
+        let mut name_bytes = name.as_bytes().to_vec();
+        name_bytes.push(0);
+        payload.extend_from_slice(&encode_rta(libc::IFLA_IFNAME, &name_bytes));
+        encode_nlmsg(libc::RTM_NEWLINK, &payload)
+    }
+
+    fn addr_event(ifindex: u32, name: &str) -> Vec<u8> {
+        let mut payload = ifaddrmsg(ifindex);
+        let mut name_bytes = name.as_bytes().to_vec();
+        name_bytes.push(0);
+        payload.extend_from_slice(&encode_rta(libc::IFA_LABEL, &name_bytes));
+        encode_nlmsg(libc::RTM_NEWADDR, &payload)
+    }
+
+    #[test]
+    fn parse_newlink_extracts_name() {
+        let buf = link_event(2, "eth0");
+        assert_eq!(parse_netlink_ifaces(&buf), vec![(2, "eth0".into())]);
+    }
+
+    #[test]
+    fn parse_newaddr_extracts_label() {
+        let buf = addr_event(3, "wlan0");
+        assert_eq!(parse_netlink_ifaces(&buf), vec![(3, "wlan0".into())]);
+    }
+
+    #[test]
+    fn skipped_wlan_is_not_relevant() {
+        let buf = link_event(3, "wlan0");
+        assert!(!netlink_is_relevant(&buf, &[], &["wlan".into()]));
+        assert!(netlink_is_relevant(&buf, &[], &[]));
+    }
+
+    #[test]
+    fn docker_veth_not_relevant() {
+        assert!(!netlink_is_relevant(
+            &link_event(10, "veth0abc"),
+            &[],
+            &[]
+        ));
+        assert!(!netlink_is_relevant(&link_event(11, "docker0"), &[], &[]));
+        assert!(!netlink_is_relevant(&link_event(1, "lo"), &[], &[]));
+    }
+
+    #[test]
+    fn eth_is_relevant_by_default() {
+        assert!(netlink_is_relevant(&link_event(2, "eth0"), &[], &[]));
+        assert!(netlink_is_relevant(
+            &link_event(2, "eth0"),
+            &["eth".into()],
+            &[]
+        ));
+        assert!(!netlink_is_relevant(
+            &link_event(2, "eth0"),
+            &["wlan".into()],
+            &[]
+        ));
+    }
+
     #[test]
     fn spawn_starts_and_stops() {
         let (rx, stop) = spawn().expect("spawn iface watcher");
@@ -128,7 +369,6 @@ mod tests {
 
     #[test]
     fn iface_change_channel_is_bounded() {
-        // Capacity is a compile-time constant; keep the check as a const assert.
         const { assert!(IFACE_CHANGE_CAPACITY > 0) };
     }
 
@@ -172,8 +412,6 @@ mod tests {
 
     #[test]
     fn iface_change_on_dummy_down_up_same_addr() {
-        // Same address after a link down/up (the suspend analogue): netlink
-        // must still signal so the main loop can force IGMP leave+join.
         let name = format!("mdnsdn{}", std::process::id() % 10000);
         let add = std::process::Command::new("ip")
             .args(["link", "add", &name, "type", "dummy"])
@@ -236,7 +474,6 @@ mod tests {
             prev,
             prev + Duration::from_secs(60)
         ));
-        // Skew shrinking is not a suspend.
         assert!(!crate::sys::suspend_detected(
             Duration::from_secs(10),
             Duration::from_secs(1)

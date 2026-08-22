@@ -83,13 +83,13 @@ pub fn open_rtnetlink(recv_timeout: Duration) -> std::io::Result<OwnedFd> {
     Ok(sock)
 }
 
-/// Returns `Ok(true)` when at least one netlink message was read (payload ignored).
-pub fn recv_netlink_any(sock: &OwnedFd) -> std::io::Result<bool> {
-    let mut buf = [0u8; 8192];
-    let mut iov = [IoSliceMut::new(&mut buf)];
-    // SAFETY: `sock` is a valid netlink fd. `iov` points at a live mutable
-    // buffer of known length for the duration of recvmsg. We do not retain
-    // pointers after return; payload is discarded.
+/// Receive one netlink datagram into `buf`. Returns the number of bytes read.
+///
+/// `Ok(0)` means the receive timed out.
+pub fn recv_netlink(sock: &OwnedFd, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut iov = [IoSliceMut::new(buf)];
+    // SAFETY: `sock` is a valid netlink fd. `iov` points at `buf` for the
+    // duration of recvmsg. We do not retain pointers after return.
     let n = unsafe {
         let mut msg: libc::msghdr = mem::zeroed();
         msg.msg_iov = iov.as_mut_ptr().cast();
@@ -99,12 +99,11 @@ pub fn recv_netlink_any(sock: &OwnedFd) -> std::io::Result<bool> {
     if n < 0 {
         let err = std::io::Error::last_os_error();
         if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) {
-            return Ok(false);
+            return Ok(0);
         }
         return Err(err);
     }
-    debug_assert!(n >= 0);
-    Ok(n > 0)
+    Ok(n as usize)
 }
 
 /// Enable `IP_PKTINFO` so recvmsg delivers receiving-interface metadata (IPv4).

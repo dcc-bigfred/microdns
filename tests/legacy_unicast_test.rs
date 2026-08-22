@@ -1,6 +1,6 @@
 //! Unit + integration tests for the legacy unicast mDNS responder.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use microdns::legacy_unicast::{
     build_response, choose_v4, choose_v4_for_iface, choose_v6_for_iface, hosts_match, parse_query,
-    spawn, AnswerSet, IfaceAddr4, IfaceAddr6, MembershipRefresh, ParsedQuery, LEGACY_TTL, QTYPE_A,
-    QTYPE_AAAA, QTYPE_ANY,
+    should_answer_legacy, spawn, AnswerSet, IfaceAddr4, IfaceAddr6, MembershipRefresh, ParsedQuery,
+    LEGACY_TTL, MDNS_PORT, QTYPE_A, QTYPE_AAAA, QTYPE_ANY,
 };
 
 fn encode_name(name: &str) -> Vec<u8> {
@@ -25,13 +25,17 @@ fn encode_name(name: &str) -> Vec<u8> {
 }
 
 fn build_query(id: u16, qname: &str, qtype: u16, qclass: u16) -> Vec<u8> {
+    build_query_counts(id, qname, qtype, qclass, 0)
+}
+
+fn build_query_counts(id: u16, qname: &str, qtype: u16, qclass: u16, nscount: u16) -> Vec<u8> {
     let name = encode_name(qname);
     let mut pkt = Vec::with_capacity(12 + name.len() + 4);
     pkt.extend_from_slice(&id.to_be_bytes());
     pkt.extend_from_slice(&0u16.to_be_bytes()); // flags
     pkt.extend_from_slice(&1u16.to_be_bytes()); // qdcount
     pkt.extend_from_slice(&0u16.to_be_bytes());
-    pkt.extend_from_slice(&0u16.to_be_bytes());
+    pkt.extend_from_slice(&nscount.to_be_bytes());
     pkt.extend_from_slice(&0u16.to_be_bytes());
     pkt.extend_from_slice(&name);
     pkt.extend_from_slice(&qtype.to_be_bytes());
@@ -75,10 +79,29 @@ fn parse_rejects_response_qr() {
 
 #[test]
 fn parse_accepts_mdns_multicast_query() {
-    // Multicast queries (src port 5353) are answered; content selects per-iface IP.
+    // Packet content is still a valid A query; handle_packet refuses src port 5353.
     let pkt = build_query(1, "bigfred.local.", QTYPE_A, 1);
     let q = parse_query(&pkt).expect("parse");
     assert_eq!(q.qtype, QTYPE_A);
+}
+
+#[test]
+fn parse_rejects_probe_with_nscount() {
+    let pkt = build_query_counts(1, "bigfred.local.", QTYPE_ANY, 1, 1);
+    assert!(parse_query(&pkt).is_none());
+}
+
+#[test]
+fn should_answer_only_legacy_unicast_from_others() {
+    let answers = sample_answers();
+    let ephemeral = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 50), 12345));
+    let mdns_port = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 50), MDNS_PORT));
+    let own = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 10), 12345));
+    let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 12345));
+    assert!(should_answer_legacy(ephemeral, &answers));
+    assert!(should_answer_legacy(loopback, &answers));
+    assert!(!should_answer_legacy(mdns_port, &answers));
+    assert!(!should_answer_legacy(own, &answers));
 }
 
 #[test]

@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use microdns::config::default_config_path;
 use microdns::ctl;
 use microdns::datadir;
+use microdns::doctor;
 use microdns::run;
 use microdns::version;
 
@@ -46,6 +47,12 @@ enum Commands {
     Services {
         #[command(subcommand)]
         command: ServicesCommands,
+    },
+    /// Diagnose mDNS sockets, IGMP membership, and live daemon state
+    Doctor {
+        /// Output format
+        #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Human)]
+        output: OutputFormat,
     },
 }
 
@@ -113,5 +120,27 @@ fn main() -> ExitCode {
                 }
             },
         },
+        Commands::Doctor { output } => {
+            let report = doctor::collect(&config_path, &socket);
+            match report {
+                Ok(report) => {
+                    let result = match output {
+                        OutputFormat::Human => doctor::print_human(&mut std::io::stdout(), &report),
+                        OutputFormat::Json => doctor::print_json(&mut std::io::stdout(), &report),
+                    };
+                    match result {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(e) => {
+                            eprintln!("{e}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
     }
 }

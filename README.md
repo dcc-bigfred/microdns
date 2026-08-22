@@ -21,15 +21,24 @@ per receiving interface so a WiFi client gets the WiFi address.
 - Optional dcc-bus discovery: when `bigfred.enabled` (default true), polls the
   loco-server Unix socket (`$DATA_DIR/run/bigfred.sock`) for `dcc_bus_list` and
   advertises `_z21._udp` / `_withrottle._tcp` on the ports in that JSON. Missing
-  socket is retried every `retry.bigfredMs` (default 45s).
+  socket is retried with exponential backoff (2 s … `retry.bigfredMs`, default
+  45 s). Last-good dcc-bus ads are kept across a short socket outage and only
+  withdrawn after `retry.bigfredMs` of consecutive failures.
 - Optional microinit watch: when `microinit.enabled` (default true), holds one
   connection to `$DATA_DIR/run/microinit.sock` (`{type:watch,label_keys:["microdns-port"]}`)
   and advertises running services that have `microdns-port` + `microdns-type`.
   `microdns-host` is optional (kernel hostname if omitted). `microdns-txt-*`
   labels become TXT pairs. Reconnect backoff is `retry.microinitReconnectMs`
   (default 3s). Last-good ads are kept across a dropped socket.
+- Periodic unsolicited re-announcements (`announce.periodMs`, default 55 s) plus
+  a 1/2/4/8 s burst after a real advertisement change. Re-register never sends
+  a goodbye (TTL 0); `unregister` is only used when a service is actually gone.
+- Self-check every `selfcheck.periodMs` (default 60 s): IGMP 224.0.0.251 on
+  used NICs, mdns-sd thread alive, recent `Announce` events. Escalates
+  re-announce → daemon recreate.
 - Optional Z21 UDP LAN discovery beacon (LAN_GET_SERIAL_NUMBER reply broadcast)
-- Unix control socket (`$DATA_DIR/run/microdns.sock`): `microdns services list` queries the live daemon
+- Unix control socket (`$DATA_DIR/run/microdns.sock`): `microdns services list`
+  and `microdns doctor` query the live daemon
 - Hot-reload via inotify on the config file
 - Static musl builds for linux/arm64 and linux/amd64
 
@@ -67,6 +76,8 @@ Default path: `$DATA_DIR/etc/microdns.json`. Created with defaults if missing.
     "ifaceMs": 5000,
     "microinitReconnectMs": 3000
   },
+  "announce": { "periodMs": 55000, "burstCount": 4 },
+  "selfcheck": { "periodMs": 60000 },
   "skipInterfaces": [],
   "interfaces": []
 }
@@ -80,11 +91,18 @@ Default path: `$DATA_DIR/etc/microdns.json`. Created with defaults if missing.
 - `dccBus.host` (optional): DNS-SD hostname without `.local` for `_z21._udp` /
   `_withrottle._tcp` ads. When omitted, mdns-sd uses the kernel hostname and
   `microdns services list` shows `-` in HOST. Product templates set `"bigfred"`.
-- `retry.bigfredMs` (default `45000`): wait between probes while the socket is down.
+- `retry.bigfredMs` (default `45000`): cap on backoff while the BigFred socket
+  is down, and grace period before withdrawing last-good dcc-bus ads.
+  First failures retry at 2 s, 4 s, 8 s, … up to this cap.
   `retry.pollMs` (default `25000`) is the poll interval once connected.
   Existing files may still use `retry.microinitMs`; that alias still maps to
   `pollMs` (BigFred), **not** the microinit watch. Use `retry.microinitReconnectMs`
   for watch reconnect backoff.
+- `announce.periodMs` (default `55000`): unsolicited re-announce interval, kept
+  below the 120 s host-record TTL. `announce.burstCount` (default `4`) extra
+  announcements at 1 s, 2 s, 4 s, 8 s after a real change.
+- `selfcheck.periodMs` (default `60000`): how often to verify multicast
+  membership and recent announcements.
 - Retry intervals are configurable; config changes are hot-reloaded.
 - `skipInterfaces` (default `[]`): extra interface-name prefixes to skip
   (case-insensitive), in addition to the built-in docker/veth/br-*/cni/
@@ -104,7 +122,12 @@ Default path: `$DATA_DIR/etc/microdns.json`. Created with defaults if missing.
 - Hostname A/AAAA answers (`bigfred.local`) are selected **per receiving
   interface** (via `IP_PKTINFO`): a client querying on WiFi gets the WiFi
   address, not the Ethernet one. Interface add/remove/address changes are
-  detected via rtnetlink with polling fallback.
+  detected via rtnetlink with polling fallback. Netlink events on skipped
+  interfaces (e.g. `wlan0` on the hub) do not re-announce Ethernet mDNS.
+  IGMP leave+join is reserved for real address-set changes and suspend/resume.
+- On a BigFred hub, `micronet` in gateway mode re-probes foreign DHCP every 15 s
+  and a failed `micronet check` tears the address down. microdns treats that as
+  a normal address change (re-announce, no goodbye).
 
 ## Run
 
@@ -132,12 +155,31 @@ plus optional `host` / `txt`). The CLI talks to the live daemon over the ctl
 socket — it does not read `microdns.json` on its own. If the socket is missing,
 the error is the same shape as `bf` (`is microdns running?`).
 
+Diagnose sockets, IGMP membership, mdns-sd counters, and the last self-check
+(works even if the daemon is down for the local kernel half):
+
+```bash
+microdns doctor
+microdns doctor -o json
+```
+
+On a second machine in the same LAN, confirm there are no goodbye packets
+(TTL 0) except when a service is actually removed, and that unsolicited
+announcements repeat about every 55 s:
+
+```bash
+tcpdump -ni <iface> -vv 'udp port 5353 and host <hub-ip>'
+# look for: bigfred._http._tcp.local, TTL 0 (bad unless the service went away)
+microinit logs microdns --follow   # on the hub
+cat /proc/net/igmp                 # 224.0.0.251 on eth0
+```
+
 Flags:
 
 - `--config <path>` — config file (default `$DATA_DIR/etc/microdns.json`)
 - `--data-dir <path>` — set `DATA_DIR` before start
 - `--socket <path>` — ctl socket (default `$DATA_DIR/run/microdns.sock`)
-- `-o, --output human|json` — `services list` output (default `human`)
+- `-o, --output human|json` — `services list` / `doctor` output (default `human`)
 - `--version` / `info` — build and release metadata
 
 ## Build

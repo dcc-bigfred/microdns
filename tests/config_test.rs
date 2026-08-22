@@ -59,6 +59,9 @@ fn default_roundtrip() {
     assert_eq!(back.retry.mdns_ms, 3000);
     assert_eq!(back.retry.bigfred_ms, 45_000);
     assert_eq!(back.retry.microinit_reconnect_ms, 3000);
+    assert_eq!(back.announce.period_ms, 55_000);
+    assert_eq!(back.announce.burst_count, 4);
+    assert_eq!(back.selfcheck.period_ms, 60_000);
     assert!(!json.contains("microinitMs"));
     assert!(!json.contains("procMs"));
     assert!(!json.contains("z21Port"));
@@ -179,4 +182,27 @@ fn dcc_bus_blank_host_is_none() {
     let cfg: Config = serde_json::from_str(json).unwrap();
     assert_eq!(cfg.dcc_bus.host.as_deref(), Some("  "));
     assert_eq!(cfg.dcc_bus.advertised_host(), None);
+}
+
+#[test]
+fn announce_and_selfcheck_bind_camel_case() {
+    let json = r#"{
+            "services": [],
+            "announce": { "periodMs": 40000, "burstCount": 3 },
+            "selfcheck": { "periodMs": 15000 }
+        }"#;
+    let cfg: Config = serde_json::from_str(json).unwrap();
+    assert_eq!(cfg.announce.period_ms, 40_000);
+    assert_eq!(cfg.announce.burst_count, 3);
+    assert_eq!(cfg.selfcheck.period_ms, 15_000);
+}
+
+#[test]
+fn validate_rejects_tiny_announce_period() {
+    let mut cfg = Config::default();
+    cfg.announce.period_ms = 50;
+    assert!(cfg.validate().is_err());
+    cfg.announce.period_ms = 1000;
+    cfg.announce.burst_count = 9;
+    assert!(cfg.validate().is_err());
 }

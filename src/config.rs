@@ -199,6 +199,61 @@ fn default_microinit_reconnect_ms() -> u64 {
     3000
 }
 
+/// Unsolicited mDNS re-announcement (RFC 6762 §8.3 plus a periodic refresh).
+///
+/// `mdns-sd` only sends two announcements at register time. Clients that miss
+/// those packets (or flush on a later goodbye) would never see the service
+/// again without this ticker.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnounceConfig {
+    /// Interval between full re-announcements of the current set (milliseconds).
+    /// Default 55 s, below the 120 s host-record TTL.
+    #[serde(default = "default_announce_period_ms")]
+    pub period_ms: u64,
+    /// Extra announcements after a real advertisement change, at 1 s, 2 s, 4 s, …
+    /// `burstCount` 4 → 1 s, 2 s, 4 s, 8 s. Zero disables the burst.
+    #[serde(default = "default_announce_burst_count")]
+    pub burst_count: u8,
+}
+
+impl Default for AnnounceConfig {
+    fn default() -> Self {
+        Self {
+            period_ms: default_announce_period_ms(),
+            burst_count: default_announce_burst_count(),
+        }
+    }
+}
+
+fn default_announce_period_ms() -> u64 {
+    55_000
+}
+fn default_announce_burst_count() -> u8 {
+    4
+}
+
+/// Periodic self-verification of multicast membership and announcements.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SelfCheckConfig {
+    /// How often to verify IGMP membership and recent announcements (milliseconds).
+    #[serde(default = "default_selfcheck_period_ms")]
+    pub period_ms: u64,
+}
+
+impl Default for SelfCheckConfig {
+    fn default() -> Self {
+        Self {
+            period_ms: default_selfcheck_period_ms(),
+        }
+    }
+}
+
+fn default_selfcheck_period_ms() -> u64 {
+    60_000
+}
+
 /// Top-level microdns configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -213,6 +268,10 @@ pub struct Config {
     pub dcc_bus: DccBusConfig,
     #[serde(default)]
     pub retry: RetryConfig,
+    #[serde(default)]
+    pub announce: AnnounceConfig,
+    #[serde(default)]
+    pub selfcheck: SelfCheckConfig,
     /// Extra interface name prefixes to skip (case-insensitive), in addition
     /// to the built-in docker/veth/br-*/... list. Empty by default so mDNS
     /// advertises on every usable interface (including `wlan*`) — operators
@@ -244,6 +303,8 @@ impl Default for Config {
             microinit: MicroinitConfig::default(),
             dcc_bus: DccBusConfig::default(),
             retry: RetryConfig::default(),
+            announce: AnnounceConfig::default(),
+            selfcheck: SelfCheckConfig::default(),
             skip_interfaces: Vec::new(),
             interfaces: Vec::new(),
         }
@@ -274,6 +335,21 @@ impl Config {
         }
         validate_iface_prefixes("skipInterfaces", &self.skip_interfaces)?;
         validate_iface_prefixes("interfaces", &self.interfaces)?;
+        if self.announce.period_ms < 1000 {
+            return Err(Error::Config(
+                "announce.periodMs must be at least 1000".into(),
+            ));
+        }
+        if self.announce.burst_count > 8 {
+            return Err(Error::Config(
+                "announce.burstCount must be at most 8".into(),
+            ));
+        }
+        if self.selfcheck.period_ms < 1000 {
+            return Err(Error::Config(
+                "selfcheck.periodMs must be at least 1000".into(),
+            ));
+        }
         Ok(())
     }
 }
