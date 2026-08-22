@@ -3,9 +3,7 @@ use std::time::{Duration, Instant};
 
 use microdns::legacy_unicast::IfaceAddr4;
 use microdns::mdns::AnnounceLog;
-use microdns::selfcheck::{
-    missing_mdns_membership, parse_igmp, stale_announces, MDNS_GROUP_V4,
-};
+use microdns::selfcheck::{missing_mdns_membership, parse_igmp, stale_announces, MDNS_GROUP_V4};
 
 const SAMPLE_IGMP: &str = "\
 Idx\tDevice    : Count Querier\tGroup    Users Timer    Reporter

@@ -203,7 +203,13 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
     let mut recreate_daemon = false;
     let mut last_skew = sys::boottime_monotonic_skew();
     let mut next_periodic = Instant::now()
-        + Duration::from_millis(shared.config.read().map(|c| c.announce.period_ms).unwrap_or(55_000));
+        + Duration::from_millis(
+            shared
+                .config
+                .read()
+                .map(|c| c.announce.period_ms)
+                .unwrap_or(55_000),
+        );
     let mut burst_deadlines: Vec<Instant> = Vec::new();
     let mut next_selfcheck = Instant::now()
         + Duration::from_millis(
@@ -733,7 +739,9 @@ fn lock_mutex<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[must_use]
 pub fn bigfred_backoff_ms(failures: u32, cap: u64) -> u64 {
     let shift = failures.min(15);
-    (2000u64.saturating_mul(1u64 << shift)).min(cap.max(500)).max(500)
+    (2000u64.saturating_mul(1u64 << shift))
+        .min(cap.max(500))
+        .max(500)
 }
 
 /// Unsolicited re-announce deadlines after a real advertisement change.
@@ -774,13 +782,13 @@ fn sort_dynamic_ads(dynamic: &mut [DynAd]) {
             a.entry.host.as_deref().unwrap_or(""),
             txt_sort_key(&a.entry.txt),
         )
-        .cmp(&(
-            b.entry.name.as_str(),
-            b.entry.type_.as_str(),
-            b.entry.port,
-            b.entry.host.as_deref().unwrap_or(""),
-            txt_sort_key(&b.entry.txt),
-        ))
+            .cmp(&(
+                b.entry.name.as_str(),
+                b.entry.type_.as_str(),
+                b.entry.port,
+                b.entry.host.as_deref().unwrap_or(""),
+                txt_sort_key(&b.entry.txt),
+            ))
     });
 }
 
@@ -824,9 +832,9 @@ pub fn plan_reconcile(
         }
         fn key(x: &ReconcileAction) -> &str {
             match x {
-                ReconcileAction::Add(k) | ReconcileAction::Refresh(k) | ReconcileAction::Drop(k) => {
-                    k
-                }
+                ReconcileAction::Add(k)
+                | ReconcileAction::Refresh(k)
+                | ReconcileAction::Drop(k) => k,
             }
         }
         rank(a).cmp(&rank(b)).then_with(|| key(a).cmp(key(b)))

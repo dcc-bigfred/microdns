@@ -159,7 +159,11 @@ pub fn print_human(w: &mut impl Write, report: &DoctorReport) -> Result<()> {
                 d.metrics.get("unregister-resend").copied().unwrap_or(0),
                 d.metrics.get("respond").copied().unwrap_or(0),
             )?;
-            writeln!(w, "  last announce (seconds ago): {:?}", d.last_announce_secs_ago)?;
+            writeln!(
+                w,
+                "  last announce (seconds ago): {:?}",
+                d.last_announce_secs_ago
+            )?;
             writeln!(
                 w,
                 "  selfcheck: ok={} escalation={:?} {}",

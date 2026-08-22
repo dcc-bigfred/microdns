@@ -149,7 +149,10 @@ fn plan_reconcile_refresh_does_not_drop() {
     registered.insert(key.clone(), entry);
 
     let same = plan_reconcile(&desired, &registered, false);
-    assert!(same.is_empty(), "unchanged set must not unregister: {same:?}");
+    assert!(
+        same.is_empty(),
+        "unchanged set must not unregister: {same:?}"
+    );
 
     let refresh = plan_reconcile(&desired, &registered, true);
     assert_eq!(refresh, vec![ReconcileAction::Refresh(key.clone())]);
@@ -184,10 +187,7 @@ fn plan_reconcile_add_and_drop() {
     let actions = plan_reconcile(&desired, &registered, false);
     assert_eq!(
         actions,
-        vec![
-            ReconcileAction::Add(newbie),
-            ReconcileAction::Drop(gone),
-        ]
+        vec![ReconcileAction::Add(newbie), ReconcileAction::Drop(gone),]
     );
 }
 

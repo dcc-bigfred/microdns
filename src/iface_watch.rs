@@ -184,8 +184,7 @@ pub(crate) fn parse_netlink_ifaces(buf: &[u8]) -> Vec<(u32, String)> {
             libc::RTM_NEWLINK | libc::RTM_DELLINK | libc::RTM_GETLINK
                 if payload.len() >= IFINFOMSG_LEN =>
             {
-                let ifindex =
-                    i32::from_ne_bytes(payload[4..8].try_into().unwrap_or([0; 4])) as u32;
+                let ifindex = i32::from_ne_bytes(payload[4..8].try_into().unwrap_or([0; 4])) as u32;
                 let name =
                     rta_str(&payload[IFINFOMSG_LEN..], libc::IFLA_IFNAME).unwrap_or_default();
                 if ifindex != 0 {
@@ -194,8 +193,7 @@ pub(crate) fn parse_netlink_ifaces(buf: &[u8]) -> Vec<(u32, String)> {
             }
             libc::RTM_NEWADDR | libc::RTM_DELADDR if payload.len() >= IFADDRMSG_LEN => {
                 let ifindex = u32::from_ne_bytes(payload[4..8].try_into().unwrap_or([0; 4]));
-                let name =
-                    rta_str(&payload[IFADDRMSG_LEN..], libc::IFA_LABEL).unwrap_or_default();
+                let name = rta_str(&payload[IFADDRMSG_LEN..], libc::IFA_LABEL).unwrap_or_default();
                 if ifindex != 0 {
                     out.push((ifindex, name));
                 }
@@ -335,11 +333,7 @@ mod tests {
 
     #[test]
     fn docker_veth_not_relevant() {
-        assert!(!netlink_is_relevant(
-            &link_event(10, "veth0abc"),
-            &[],
-            &[]
-        ));
+        assert!(!netlink_is_relevant(&link_event(10, "veth0abc"), &[], &[]));
         assert!(!netlink_is_relevant(&link_event(11, "docker0"), &[], &[]));
         assert!(!netlink_is_relevant(&link_event(1, "lo"), &[], &[]));
     }

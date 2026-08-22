@@ -37,10 +37,7 @@ impl AnnounceLog {
 
     #[must_use]
     pub fn snapshot(&self) -> HashMap<String, Instant> {
-        self.inner
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default()
+        self.inner.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
     pub fn clear(&self) {
