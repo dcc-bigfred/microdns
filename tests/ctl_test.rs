@@ -20,7 +20,10 @@ fn tmp_sock() -> PathBuf {
         .unwrap()
         .as_nanos();
     let seq = TMP_SOCK_SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("microdns-ctl-{nanos}-{seq}.sock"))
+    // Thread id: parallel tests can read the same `nanos` and still share `seq` ordering
+    // in edge cases; include the test thread so ctl socket paths never collide.
+    let tid = format!("{:?}", std::thread::current().id());
+    std::env::temp_dir().join(format!("microdns-ctl-{nanos}-{seq}-{tid}.sock"))
 }
 
 fn sample_ads() -> DesiredAds {
