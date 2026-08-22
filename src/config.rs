@@ -119,11 +119,30 @@ pub struct DccBusConfig {
     /// Broadcast LAN_GET_SERIAL_NUMBER reply when a Z21 port is advertised.
     #[serde(default = "default_true")]
     pub beacon: bool,
+    /// Optional DNS-SD hostname without `.local` for dcc-bus ads.
+    /// Absent/empty: mdns-sd uses the kernel hostname; the ctl table shows `-`.
+    /// Product templates (BigFred OS / loco-server) set `"bigfred"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 impl Default for DccBusConfig {
     fn default() -> Self {
-        Self { beacon: true }
+        Self {
+            beacon: true,
+            host: None,
+        }
+    }
+}
+
+impl DccBusConfig {
+    /// Trimmed non-empty `host`, if configured.
+    #[must_use]
+    pub fn advertised_host(&self) -> Option<&str> {
+        self.host
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 }
 

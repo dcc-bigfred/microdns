@@ -458,6 +458,7 @@ pub fn dcc_service_entry(
     command_station_id: u32,
     layout_name: &str,
     serial: Option<u32>,
+    host: Option<&str>,
 ) -> ServiceEntry {
     let mut txt = HashMap::new();
     txt.insert("proto".into(), protocol.into());
@@ -474,7 +475,10 @@ pub fn dcc_service_entry(
         type_: type_.into(),
         protocol: protocol.into(),
         port,
-        host: None,
+        host: host
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         txt: Some(txt),
     }
 }

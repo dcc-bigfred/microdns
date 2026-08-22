@@ -60,7 +60,7 @@ fn append_station_uses_api_ports_not_defaults() {
         skip_interfaces: Vec::new(),
         interfaces: Vec::new(),
     };
-    append_station_ads(&mut desired, &program_running_wit(), true);
+    append_station_ads(&mut desired, &program_running_wit(), true, None);
     assert_eq!(desired.dynamic.len(), 2);
     let wit = desired
         .dynamic
@@ -74,6 +74,7 @@ fn append_station_uses_api_ports_not_defaults() {
     assert_eq!(txt.get("layoutId").map(String::as_str), Some("2"));
     assert_eq!(txt.get("layoutName").map(String::as_str), Some("Klubowa"));
     assert_eq!(txt.get("commandStationId").map(String::as_str), Some("5"));
+    assert_eq!(wit.entry.host, None);
     assert_eq!(
         desired.beacons,
         vec![BeaconWant {
@@ -81,6 +82,24 @@ fn append_station_uses_api_ports_not_defaults() {
             serial: 258_002_005
         }]
     );
+}
+
+#[test]
+fn append_station_sets_configured_host() {
+    let mut desired = DesiredAds {
+        static_services: Vec::new(),
+        dynamic: Vec::new(),
+        beacons: Vec::new(),
+        ips: Vec::new(),
+        ips_v6: Vec::new(),
+        skip_interfaces: Vec::new(),
+        interfaces: Vec::new(),
+    };
+    append_station_ads(&mut desired, &program_running_wit(), false, Some("bigfred"));
+    assert!(desired
+        .dynamic
+        .iter()
+        .all(|d| d.entry.host.as_deref() == Some("bigfred")));
 }
 
 #[test]
@@ -96,12 +115,12 @@ fn append_station_skips_stopped_and_disabled() {
     };
     let mut stopped = program_running_wit();
     stopped.running = false;
-    append_station_ads(&mut desired, &stopped, true);
+    append_station_ads(&mut desired, &stopped, true, None);
     assert!(desired.dynamic.is_empty());
 
     let mut no_wit = program_running_wit();
     no_wit.withrottle_enabled = false;
     no_wit.z21_enabled = false;
-    append_station_ads(&mut desired, &no_wit, true);
+    append_station_ads(&mut desired, &no_wit, true, None);
     assert!(desired.dynamic.is_empty());
 }

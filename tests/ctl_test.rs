@@ -223,6 +223,22 @@ fn human_table_headers_and_sources() {
 }
 
 #[test]
+fn human_table_shows_dcc_bus_host_when_set() {
+    let mut ads = sample_ads();
+    for dyn_ad in &mut ads.dynamic {
+        if dyn_ad.source == DynSource::DccBus {
+            dyn_ad.entry.host = Some("bigfred".into());
+        }
+    }
+    let listed = listed_services(&ads);
+    let table = human_table(&listed);
+    let data_lines: Vec<&str> = table.lines().skip(1).collect();
+    assert!(data_lines
+        .iter()
+        .any(|l| l.contains("12090") && l.contains("bigfred") && l.contains("dccBus")));
+}
+
+#[test]
 fn cli_rejects_invalid_output_format() {
     let exe = env!("CARGO_BIN_EXE_microdns");
     let out = std::process::Command::new(exe)

@@ -19,6 +19,7 @@ fn bigfred_enabled_defaults_true_when_key_absent() {
     assert!(cfg.bigfred.enabled);
     assert!(cfg.microinit.enabled);
     assert!(cfg.dcc_bus.beacon);
+    assert_eq!(cfg.dcc_bus.host, None);
     assert_eq!(cfg.retry.bigfred_ms, 45_000);
 }
 
@@ -51,6 +52,7 @@ fn default_roundtrip() {
     let back: Config = serde_json::from_str(&json).unwrap();
     assert_eq!(cfg, back);
     assert!(back.dcc_bus.beacon);
+    assert_eq!(back.dcc_bus.host, None);
     assert!(back.bigfred.enabled);
     assert!(back.microinit.enabled);
     assert_eq!(back.retry.poll_ms, 25_000);
@@ -162,4 +164,19 @@ fn validate_rejects_duplicate_names() {
     let mut cfg = Config::default();
     cfg.services.push(cfg.services[0].clone());
     assert!(cfg.validate().is_err());
+}
+
+#[test]
+fn dcc_bus_host_is_optional() {
+    let json = r#"{"services":[],"dccBus":{"beacon":true,"host":"bigfred"}}"#;
+    let cfg: Config = serde_json::from_str(json).unwrap();
+    assert_eq!(cfg.dcc_bus.advertised_host(), Some("bigfred"));
+}
+
+#[test]
+fn dcc_bus_blank_host_is_none() {
+    let json = r#"{"services":[],"dccBus":{"host":"  "}}"#;
+    let cfg: Config = serde_json::from_str(json).unwrap();
+    assert_eq!(cfg.dcc_bus.host.as_deref(), Some("  "));
+    assert_eq!(cfg.dcc_bus.advertised_host(), None);
 }

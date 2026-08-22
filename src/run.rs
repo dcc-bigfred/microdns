@@ -295,6 +295,12 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
                     }
                 }
             }
+            if let Some(h) = cfg.dcc_bus.advertised_host() {
+                let host = mdns::normalize_hostname(h);
+                if !hosts.iter().any(|existing| existing == &host) {
+                    hosts.push(host);
+                }
+            }
             let next = AnswerSet {
                 hosts,
                 v4: mdns::preferred_ipv4_ifaces(&interfaces, &skip_interfaces),
@@ -343,7 +349,7 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
             }
             if let Some(programs) = &last_programs {
                 for p in programs {
-                    append_station_ads(&mut desired, p, beacon);
+                    append_station_ads(&mut desired, p, beacon, cfg.dcc_bus.advertised_host());
                 }
             }
         }
@@ -429,7 +435,12 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn append_station_ads(desired: &mut DesiredAds, program: &Program, beacon: bool) {
+pub fn append_station_ads(
+    desired: &mut DesiredAds,
+    program: &Program,
+    beacon: bool,
+    host: Option<&str>,
+) {
     if !program.running {
         return;
     }
@@ -448,6 +459,7 @@ pub fn append_station_ads(desired: &mut DesiredAds, program: &Program, beacon: b
                 program.command_station_id,
                 layout_name,
                 Some(serial),
+                host,
             ),
             source: DynSource::DccBus,
         });
@@ -470,6 +482,7 @@ pub fn append_station_ads(desired: &mut DesiredAds, program: &Program, beacon: b
                 program.command_station_id,
                 layout_name,
                 None,
+                host,
             ),
             source: DynSource::DccBus,
         });

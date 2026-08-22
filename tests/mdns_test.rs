@@ -90,6 +90,7 @@ fn dcc_entry_has_proto_txt() {
         5,
         "Klubowa",
         Some(258_002_005),
+        None,
     );
     let txt = e.txt.as_ref().unwrap();
     assert_eq!(txt.get("proto").unwrap(), "udp");
@@ -97,4 +98,37 @@ fn dcc_entry_has_proto_txt() {
     assert_eq!(txt.get("commandStationId").unwrap(), "5");
     assert_eq!(txt.get("layoutName").unwrap(), "Klubowa");
     assert_eq!(txt.get("serial").unwrap(), "258002005");
+    assert_eq!(e.host, None);
+}
+
+#[test]
+fn dcc_entry_keeps_configured_host() {
+    let e = dcc_service_entry(
+        "hub1",
+        "_withrottle._tcp",
+        "tcp",
+        12090,
+        1,
+        1,
+        "",
+        None,
+        Some("bigfred"),
+    );
+    assert_eq!(e.host.as_deref(), Some("bigfred"));
+}
+
+#[test]
+fn dcc_entry_blank_host_is_none() {
+    let e = dcc_service_entry(
+        "hub1",
+        "_withrottle._tcp",
+        "tcp",
+        12090,
+        1,
+        1,
+        "",
+        None,
+        Some("  "),
+    );
+    assert_eq!(e.host, None);
 }

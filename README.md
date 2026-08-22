@@ -57,7 +57,8 @@ Default path: `$DATA_DIR/etc/microdns.json`. Created with defaults if missing.
   "bigfred": { "enabled": true },
   "microinit": { "enabled": true },
   "dccBus": {
-    "beacon": true
+    "beacon": true,
+    "host": "bigfred"
   },
   "retry": {
     "bigfredMs": 45000,
@@ -76,6 +77,9 @@ Default path: `$DATA_DIR/etc/microdns.json`. Created with defaults if missing.
 - `microinit.enabled` (default `true`): watch microinit for labeled services.
   Set `false` if this host has no microinit socket.
 - `dccBus.beacon` (default `true`): Z21 LAN serial broadcast on advertised UDP ports.
+- `dccBus.host` (optional): DNS-SD hostname without `.local` for `_z21._udp` /
+  `_withrottle._tcp` ads. When omitted, mdns-sd uses the kernel hostname and
+  `microdns services list` shows `-` in HOST. Product templates set `"bigfred"`.
 - `retry.bigfredMs` (default `45000`): wait between probes while the socket is down.
   `retry.pollMs` (default `25000`) is the poll interval once connected.
   Existing files may still use `retry.microinitMs`; that alias still maps to
