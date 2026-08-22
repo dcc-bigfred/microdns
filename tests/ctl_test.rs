@@ -252,3 +252,52 @@ fn cli_rejects_invalid_output_format() {
         "{err}"
     );
 }
+
+#[test]
+fn doctor_request_returns_services_without_runtime() {
+    let sock = tmp_sock();
+    let _ = std::fs::remove_file(&sock);
+    serve(&sock, Arc::new(RwLock::new(sample_ads()))).unwrap();
+
+    let mut stream = UnixStream::connect(&sock).unwrap();
+    write_frame(&mut stream, &serde_json::json!({"type": "doctor"})).unwrap();
+    let raw = microdns::ctl::read_frame(&mut stream).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert!(v["services"].is_array());
+    assert_eq!(v["services"].as_array().unwrap().len(), 4);
+
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
+fn cli_doctor_json_works_without_daemon() {
+    let exe = env!("CARGO_BIN_EXE_microdns");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let cfg = std::env::temp_dir().join(format!("microdns-doctor-{nanos}.json"));
+    let sock = std::env::temp_dir().join(format!("microdns-doctor-{nanos}.sock"));
+    std::fs::write(&cfg, r#"{"services":[]}"#).unwrap();
+    let out = std::process::Command::new(exe)
+        .args([
+            "doctor",
+            "-o",
+            "json",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--socket",
+            sock.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&cfg);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["interfaces"].is_array());
+    assert!(v["daemon"].is_null());
+}

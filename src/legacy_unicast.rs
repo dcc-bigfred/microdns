@@ -289,6 +289,9 @@ fn handle_packet(
         Ok(g) => g.clone(),
         Err(_) => return,
     };
+    if !should_answer_legacy(peer, &answers) {
+        return;
+    }
     let Some(resp) = build_response(&query, &answers, peer.ip(), ifindex) else {
         return;
     };
@@ -440,6 +443,28 @@ fn refresh_memberships(
     }
 }
 
+/// Whether this peer should get a legacy (RFC 6762 §6.7) unicast reply.
+///
+/// Multicast queries (source port 5353) are left to mdns-sd. Packets from our
+/// own addresses are dropped so we never answer our own probes via loopback.
+#[must_use]
+pub fn should_answer_legacy(peer: SocketAddr, answers: &AnswerSet) -> bool {
+    if peer.port() == MDNS_PORT {
+        return false;
+    }
+    !is_own_addr(peer.ip(), answers)
+}
+
+fn is_own_addr(ip: IpAddr, answers: &AnswerSet) -> bool {
+    if ip.is_loopback() {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(v4) => answers.v4.iter().any(|a| a.addr == v4),
+        IpAddr::V6(v6) => answers.v6.iter().any(|a| a.addr == v6),
+    }
+}
+
 /// Parse a DNS query packet; returns [`None`] when the packet is not an
 /// A/AAAA/ANY query we should answer.
 pub fn parse_query(packet: &[u8]) -> Option<ParsedQuery> {
@@ -453,6 +478,13 @@ pub fn parse_query(packet: &[u8]) -> Option<ParsedQuery> {
     }
     let qdcount = u16::from_be_bytes([packet[4], packet[5]]);
     if qdcount == 0 {
+        return None;
+    }
+    let nscount = u16::from_be_bytes([packet[8], packet[9]]);
+    if nscount != 0 {
+        // Probe queries put unique records in the authority section (RFC 6762
+        // §8.1). Answering those with our own A/AAAA looks like a conflict to
+        // mdns-sd and can rename the host to bigfred-2.local.
         return None;
     }
 

@@ -6,19 +6,55 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use mdns_sd::{ServiceDaemon, ServiceInfo};
+use mdns_sd::{DaemonEvent, DaemonStatus, ServiceDaemon, ServiceInfo};
 
 use crate::config::ServiceEntry;
 use crate::error::{Error, Result};
 use crate::legacy_unicast::{IfaceAddr4, IfaceAddr6};
 use crate::version;
 
+/// Last successful unsolicited announcement per service fullname.
+#[derive(Debug, Default, Clone)]
+pub struct AnnounceLog {
+    inner: Arc<Mutex<HashMap<String, Instant>>>,
+}
+
+impl AnnounceLog {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record(&self, fullname: &str) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.insert(fullname.to_string(), Instant::now());
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> HashMap<String, Instant> {
+        self.inner
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn clear(&self) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.clear();
+        }
+    }
+}
+
 /// Tracked registrations keyed by full service name.
 pub struct MdnsPublisher {
     daemon: Option<ServiceDaemon>,
     registered: Mutex<HashSet<String>>,
+    announce_log: AnnounceLog,
 }
 
 impl MdnsPublisher {
@@ -29,7 +65,14 @@ impl MdnsPublisher {
         Self {
             daemon: None,
             registered: Mutex::new(HashSet::new()),
+            announce_log: AnnounceLog::new(),
         }
+    }
+
+    /// Last unsolicited announcements observed via `ServiceDaemon::monitor`.
+    #[must_use]
+    pub fn announce_log(&self) -> &AnnounceLog {
+        &self.announce_log
     }
 
     /// Ensure the underlying `ServiceDaemon` is running.
@@ -40,10 +83,40 @@ impl MdnsPublisher {
         match ServiceDaemon::new() {
             Ok(d) => {
                 log::info!("mDNS service daemon started");
+                spawn_monitor(&d, self.announce_log.clone());
                 self.daemon = Some(d);
                 Ok(())
             }
             Err(e) => Err(Error::Mdns(format!("ServiceDaemon::new: {e}"))),
+        }
+    }
+
+    /// Snapshot of mdns-sd counters, or empty if the daemon is down.
+    #[must_use]
+    pub fn metrics(&self) -> HashMap<String, i64> {
+        let Some(d) = self.daemon.as_ref() else {
+            return HashMap::new();
+        };
+        match d.get_metrics() {
+            Ok(rx) => rx
+                .recv_timeout(Duration::from_millis(400))
+                .unwrap_or_else(|_| HashMap::new()),
+            Err(_) => HashMap::new(),
+        }
+    }
+
+    /// Whether the mdns-sd thread is alive and reports [`DaemonStatus::Running`].
+    #[must_use]
+    pub fn daemon_alive(&self) -> bool {
+        let Some(d) = self.daemon.as_ref() else {
+            return false;
+        };
+        match d.status() {
+            Ok(rx) => matches!(
+                rx.recv_timeout(Duration::from_millis(400)),
+                Ok(DaemonStatus::Running)
+            ),
+            Err(_) => false,
         }
     }
 
@@ -96,16 +169,28 @@ impl MdnsPublisher {
             .register(info)
             .map_err(|e| Error::Mdns(format!("register {fullname}: {e}")))?;
 
-        if let Ok(mut set) = self.registered.lock() {
-            set.insert(fullname.clone());
+        let first = if let Ok(mut set) = self.registered.lock() {
+            set.insert(fullname.clone())
+        } else {
+            true
+        };
+        if first {
+            log::info!(
+                "registered mDNS service instance={} type={} host={} port={}",
+                entry.name,
+                ty,
+                host,
+                entry.port
+            );
+        } else {
+            log::debug!(
+                "re-announced mDNS service instance={} type={} host={} port={}",
+                entry.name,
+                ty,
+                host,
+                entry.port
+            );
         }
-        log::info!(
-            "registered mDNS service instance={} type={} host={} port={}",
-            entry.name,
-            ty,
-            host,
-            entry.port
-        );
         Ok(())
     }
 
@@ -151,6 +236,7 @@ impl MdnsPublisher {
         if let Ok(mut set) = self.registered.lock() {
             set.clear();
         }
+        self.announce_log.clear();
     }
 
     /// Drop the current `ServiceDaemon` and start a new one.
@@ -173,6 +259,52 @@ impl Default for MdnsPublisher {
 impl Drop for MdnsPublisher {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+fn spawn_monitor(daemon: &ServiceDaemon, log: AnnounceLog) {
+    let rx = match daemon.monitor() {
+        Ok(rx) => rx,
+        Err(e) => {
+            log::warn!("mDNS monitor subscribe failed: {e}");
+            return;
+        }
+    };
+    if let Err(e) = thread::Builder::new()
+        .name("mdns-monitor".into())
+        .spawn(move || {
+            while let Ok(event) = rx.recv() {
+                consume_daemon_event(&event, &log);
+            }
+            log::debug!("mDNS monitor channel closed");
+        })
+    {
+        log::warn!("mDNS monitor thread: {e}");
+    }
+}
+
+fn consume_daemon_event(event: &DaemonEvent, log: &AnnounceLog) {
+    match event {
+        DaemonEvent::Announce(name, iface) => {
+            log::info!("mDNS announced service={name} iface={iface}");
+            log.record(name);
+        }
+        DaemonEvent::Respond(iface) => {
+            log::debug!("mDNS multicast response iface={iface}");
+        }
+        DaemonEvent::IpAdd(ip) => log::info!("mDNS host address added {ip}"),
+        DaemonEvent::IpDel(ip) => log::info!("mDNS host address removed {ip}"),
+        DaemonEvent::Error(e) => log::warn!("mDNS daemon error: {e}"),
+        DaemonEvent::NameChange(change) => {
+            log::error!(
+                "mDNS name conflict original={} new={} rr_type={:?} iface={}",
+                change.original,
+                change.new_name,
+                change.rr_type,
+                change.intf_name
+            );
+        }
+        _ => {}
     }
 }
 
@@ -227,6 +359,7 @@ pub fn preferred_ipv4_ifaces(allow: &[String], skip: &[String]) -> Vec<IfaceAddr
             }
         }
     }
+    addrs.sort_by(|a, b| (&a.iface, &a.addr).cmp(&(&b.iface, &b.addr)));
     addrs
 }
 
@@ -252,6 +385,7 @@ pub fn preferred_ipv6_addrs(allow: &[String], skip: &[String]) -> Vec<IfaceAddr6
             });
         }
     }
+    addrs.sort_by(|a, b| (&a.iface, &a.addr).cmp(&(&b.iface, &b.addr)));
     addrs
 }
 
@@ -273,6 +407,8 @@ pub fn preferred_iface_indexes(allow: &[String], skip: &[String]) -> Vec<u32> {
             out.push(iface.ifindex);
         }
     }
+    out.sort_unstable();
+    out.dedup();
     out
 }
 
@@ -287,6 +423,18 @@ fn iface_usable(iface: &IfaceInfo, allow: &[String], skip: &[String]) -> bool {
         return false;
     }
     true
+}
+
+/// Whether a netlink event for `name` should wake the main loop.
+///
+/// Name-only: skip/allow filters apply, loopback is ignored. Link-up state is
+/// not required — a DOWN on an advertised NIC still needs a re-announce.
+#[must_use]
+pub fn iface_name_relevant(name: &str, allow: &[String], skip: &[String]) -> bool {
+    if name.eq_ignore_ascii_case("lo") {
+        return false;
+    }
+    !should_skip_iface(name, skip) && is_allowed_iface(name, allow)
 }
 
 /// Whether the link is usable for mDNS: `IFF_RUNNING` or `operstate == "up"`.
@@ -397,6 +545,7 @@ fn list_interfaces() -> Result<Vec<IfaceInfo>> {
             ipv6,
         });
     }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
 }
 
@@ -441,6 +590,8 @@ fn addrs_for_iface(name: &str) -> (Vec<(Ipv4Addr, Ipv4Addr)>, Vec<Ipv6Addr>) {
         }
         libc::freeifaddrs(ifap);
     }
+    ipv4.sort_by_key(|a| a.0);
+    ipv6.sort();
     (ipv4, ipv6)
 }
 

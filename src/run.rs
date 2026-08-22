@@ -134,7 +134,7 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
 
     let stop = Arc::new(AtomicBool::new(false));
     let (reload_rx, watch_stop) = config_watch::spawn(config_path.to_path_buf())?;
-    let (iface_rx, iface_watch_stop) = match iface_watch::spawn() {
+    let (iface_rx, iface_watch_stop) = match iface_watch::spawn_filtered(Arc::clone(&config)) {
         Ok(pair) => pair,
         Err(e) => {
             log::warn!("iface watcher failed to start: {e}; relying on polling");
@@ -157,7 +157,15 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
     let publisher = Arc::new(Mutex::new(MdnsPublisher::new()));
     let beacons: Arc<Mutex<Vec<ActiveBeacon>>> = Arc::new(Mutex::new(Vec::new()));
     let desired_snapshot = Arc::new(RwLock::new(DesiredAds::default()));
-    ctl::serve(ctl_socket, Arc::clone(&desired_snapshot))?;
+    let selfcheck_snapshot = Arc::new(RwLock::new(crate::selfcheck::Report::default()));
+    ctl::serve_with_runtime(
+        ctl_socket,
+        Arc::clone(&desired_snapshot),
+        Some(ctl::CtlRuntime {
+            publisher: Arc::clone(&publisher),
+            selfcheck: Arc::clone(&selfcheck_snapshot),
+        }),
+    )?;
     let answer_set = Arc::new(RwLock::new(AnswerSet::default()));
     let membership = Arc::new(MembershipRefresh::new());
     if let Err(e) = legacy_unicast::spawn_with_refresh(
@@ -184,6 +192,8 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
     let mut mdns_thr = FailThrottle::new();
     let mut bigfred_thr = FailThrottle::new();
     let mut last_programs: Option<Vec<Program>> = None;
+    let mut programs_stale_since: Option<Instant> = None;
+    let mut bigfred_failures: u32 = 0;
     let mut next_bigfred_probe = Instant::now();
     let mut last_microinit: Option<Vec<ServiceEntry>> = None;
 
@@ -192,6 +202,18 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
     let mut force_reannounce = false;
     let mut recreate_daemon = false;
     let mut last_skew = sys::boottime_monotonic_skew();
+    let mut next_periodic = Instant::now()
+        + Duration::from_millis(shared.config.read().map(|c| c.announce.period_ms).unwrap_or(55_000));
+    let mut burst_deadlines: Vec<Instant> = Vec::new();
+    let mut next_selfcheck = Instant::now()
+        + Duration::from_millis(
+            shared
+                .config
+                .read()
+                .map(|c| c.selfcheck.period_ms)
+                .unwrap_or(60_000),
+        );
+    let mut selfcheck_escalation = crate::selfcheck::Escalation::None;
 
     while !signals::shutdown_requested() && !stop.load(Ordering::SeqCst) {
         let now_skew = sys::boottime_monotonic_skew();
@@ -211,6 +233,21 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
             last_microinit = None;
         }
         let mdns_ms = cfg.retry.mdns_ms;
+        let announce_period = Duration::from_millis(cfg.announce.period_ms.max(1000));
+        let selfcheck_period = Duration::from_millis(cfg.selfcheck.period_ms.max(1000));
+        let now = Instant::now();
+        if now >= next_periodic {
+            force_reannounce = true;
+            next_periodic = now + announce_period;
+        }
+        burst_deadlines.retain(|t| {
+            if now >= *t {
+                force_reannounce = true;
+                false
+            } else {
+                true
+            }
+        });
 
         // Ensure mDNS daemon (quiet retry). Recreate after suspend so mdns-sd
         // binds fresh sockets and rejoins 224.0.0.251.
@@ -335,15 +372,30 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
                 match bigfred_watch::dcc_bus_list(&bigfred_socket) {
                     Ok(programs) => {
                         last_programs = Some(programs);
+                        programs_stale_since = None;
+                        bigfred_failures = 0;
                         bigfred_thr.ok("bigfred socket");
                         next_bigfred_probe =
                             Instant::now() + Duration::from_millis(retry.poll_ms.max(500));
                     }
                     Err(e) => {
-                        last_programs = None;
                         bigfred_thr.fail("bigfred socket", &e);
-                        next_bigfred_probe =
-                            Instant::now() + Duration::from_millis(retry.bigfred_ms.max(500));
+                        if last_programs.is_some() {
+                            let stale_from = *programs_stale_since.get_or_insert(Instant::now());
+                            if Instant::now().saturating_duration_since(stale_from)
+                                >= Duration::from_millis(retry.bigfred_ms.max(500))
+                            {
+                                log::warn!(
+                                    "bigfred socket down for {}ms; withdrawing dcc-bus ads",
+                                    retry.bigfred_ms
+                                );
+                                last_programs = None;
+                                programs_stale_since = None;
+                            }
+                        }
+                        let wait = bigfred_backoff_ms(bigfred_failures, retry.bigfred_ms);
+                        bigfred_failures = bigfred_failures.saturating_add(1);
+                        next_bigfred_probe = Instant::now() + Duration::from_millis(wait);
                     }
                 }
             }
@@ -361,13 +413,7 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
                 });
             }
         }
-        desired.dynamic.sort_by(|a, b| {
-            (&a.entry.name, &a.entry.type_, a.entry.port).cmp(&(
-                &b.entry.name,
-                &b.entry.type_,
-                b.entry.port,
-            ))
-        });
+        sort_dynamic_ads(&mut desired.dynamic);
         desired.beacons.sort_unstable();
         desired.beacons.dedup();
 
@@ -376,8 +422,11 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
         }
 
         // Reconcile advertisements when desired set changes (incl. IP churn)
-        // or when netlink/suspend forced a refresh with the same IPs.
-        if desired != last_desired || force_reannounce {
+        // or when netlink/suspend/periodic ticker forced a refresh. Refresh is
+        // register() only — never unregister() — so we do not emit goodbye
+        // packets that wipe client caches.
+        let desired_changed = desired != last_desired;
+        if desired_changed || force_reannounce {
             let ips_changed = force_reannounce
                 || desired.ips != last_desired.ips
                 || desired.ips_v6 != last_desired.ips_v6
@@ -388,12 +437,81 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
                 mdns_thr.fail("mDNS register", &e);
             } else {
                 mdns_thr.ok("mDNS register");
+                if desired_changed {
+                    burst_deadlines = announce_burst_deadlines(cfg.announce.burst_count);
+                }
                 last_desired = desired;
                 force_reannounce = false;
             }
         }
 
-        // Sleep until next poll; wake early on shutdown, netlink, or suspend.
+        if Instant::now() >= next_selfcheck {
+            let expected: Vec<String> = last_desired
+                .static_services
+                .iter()
+                .chain(last_desired.dynamic.iter().map(|d| &d.entry))
+                .map(|e| MdnsPublisher::fullname(&e.name, &e.type_))
+                .collect();
+            let want_v4 = mdns::preferred_ipv4_ifaces(
+                &last_desired.interfaces,
+                &last_desired.skip_interfaces,
+            );
+            let fresh_for = announce_period + Duration::from_secs(15);
+            let mut report = {
+                let pub_guard = lock_mutex(&publisher);
+                crate::selfcheck::evaluate(
+                    &pub_guard,
+                    &want_v4,
+                    &expected,
+                    fresh_for,
+                    Instant::now(),
+                )
+            };
+            if report.ok {
+                selfcheck_escalation = crate::selfcheck::Escalation::None;
+            } else {
+                match selfcheck_escalation {
+                    crate::selfcheck::Escalation::None => {
+                        log::warn!("selfcheck failed; re-announcing: {}", report.message);
+                        force_reannounce = true;
+                        selfcheck_escalation = crate::selfcheck::Escalation::Reannounce;
+                    }
+                    crate::selfcheck::Escalation::Reannounce => {
+                        log::error!(
+                            "selfcheck still failing; recreating mDNS daemon: {}",
+                            report.message
+                        );
+                        recreate_daemon = true;
+                        force_reannounce = true;
+                        selfcheck_escalation = crate::selfcheck::Escalation::RecreateDaemon;
+                    }
+                    crate::selfcheck::Escalation::RecreateDaemon => {
+                        log::error!(
+                            "selfcheck still failing after daemon recreate: {}",
+                            report.message
+                        );
+                    }
+                }
+            }
+            report.escalation = selfcheck_escalation;
+            if let Ok(mut w) = selfcheck_snapshot.write() {
+                *w = report;
+            }
+            next_selfcheck = Instant::now() + selfcheck_period;
+        }
+
+        // Sleep until next poll / announce / selfcheck; wake early on netlink.
+        let until_periodic = next_periodic
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64;
+        let until_burst = burst_deadlines
+            .iter()
+            .map(|t| t.saturating_duration_since(Instant::now()).as_millis() as u64)
+            .min()
+            .unwrap_or(u64::MAX);
+        let until_selfcheck = next_selfcheck
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64;
         let sleep_ms = if bigfred_enabled {
             let until_probe = next_bigfred_probe
                 .saturating_duration_since(Instant::now())
@@ -402,11 +520,15 @@ pub fn run_with_socket(config_path: &Path, ctl_socket: &Path) -> Result<()> {
         } else {
             retry.iface_ms.min(retry.mdns_ms)
         };
+        let sleep_ms = sleep_ms
+            .min(until_periodic)
+            .min(until_burst)
+            .min(until_selfcheck);
         let reason = sleep_or_iface(
             &iface_rx,
             &microinit_rx,
             &mut last_microinit,
-            Duration::from_millis(sleep_ms.max(500)),
+            Duration::from_millis(sleep_ms.max(200)),
             &mut last_skew,
         );
         apply_wake(
@@ -514,11 +636,11 @@ fn reload_loop(
 
 /// Apply desired ads without withdrawing working records first.
 ///
-/// 1. Register entries that are entirely new.
-/// 2. Refresh entries that changed (or when IPs changed): unregister then register.
-/// 3. Only then unregister keys that are no longer desired.
-/// 4. On register failure, return Err so the caller keeps `last_desired` and retries
-///    without committing a broken state.
+/// The action list comes from [`plan_reconcile`], which orders `Add` before
+/// `Refresh` before `Drop` so existing records keep answering queries until the
+/// desired set is registered, and never pairs a refresh with an unregister.
+/// On register failure this returns `Err` so the caller keeps `last_desired` and
+/// retries without committing a broken state.
 fn reconcile(
     publisher: &Arc<Mutex<MdnsPublisher>>,
     desired: &DesiredAds,
@@ -540,38 +662,24 @@ fn reconcile(
         desired_map.insert(key, dyn_ad.entry.clone());
     }
 
-    // Phase 1: add brand-new keys while old ads still answer queries.
-    for (key, entry) in &desired_map {
-        if registered.contains_key(key) {
-            continue;
+    for action in plan_reconcile(&desired_map, registered, ips_changed) {
+        match action {
+            // A refresh re-registers without unregister: mdns-sd overwrites the
+            // existing ServiceInfo, while unregister would send a goodbye
+            // (TTL 0) plus a second one 120 ms later, landing after the new
+            // announcement and wiping client caches.
+            ReconcileAction::Add(key) | ReconcileAction::Refresh(key) => {
+                let Some(entry) = desired_map.get(&key) else {
+                    continue;
+                };
+                pub_guard.register(entry, entry.host.as_deref(), allow, skip)?;
+                registered.insert(key, entry.clone());
+            }
+            ReconcileAction::Drop(key) => {
+                let _ = pub_guard.unregister(&key);
+                registered.remove(&key);
+            }
         }
-        pub_guard.register(entry, entry.host.as_deref(), allow, skip)?;
-        registered.insert(key.clone(), entry.clone());
-    }
-
-    // Phase 2: refresh changed content or rebound addresses after DHCP/iface churn.
-    for (key, entry) in &desired_map {
-        let Some(prev) = registered.get(key) else {
-            continue;
-        };
-        if prev == entry && !ips_changed {
-            continue;
-        }
-        let _ = pub_guard.unregister(key);
-        pub_guard.register(entry, entry.host.as_deref(), allow, skip)?;
-        registered.insert(key.clone(), entry.clone());
-    }
-
-    // Phase 3: drop obsolete keys only after desired set is registered.
-    let desired_keys: HashSet<String> = desired_map.keys().cloned().collect();
-    let stale: Vec<String> = registered
-        .keys()
-        .filter(|k| !desired_keys.contains(*k))
-        .cloned()
-        .collect();
-    for key in stale {
-        let _ = pub_guard.unregister(&key);
-        registered.remove(&key);
     }
 
     drop(pub_guard);
@@ -619,6 +727,111 @@ fn lock_mutex<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
             poisoned.into_inner()
         }
     }
+}
+
+/// Exponential backoff for a missing BigFred socket: 2 s, 4 s, 8 s, … cap.
+#[must_use]
+pub fn bigfred_backoff_ms(failures: u32, cap: u64) -> u64 {
+    let shift = failures.min(15);
+    (2000u64.saturating_mul(1u64 << shift)).min(cap.max(500)).max(500)
+}
+
+/// Unsolicited re-announce deadlines after a real advertisement change.
+/// `burst_count` 4 → now+1s, +2s, +4s, +8s.
+#[must_use]
+pub fn announce_burst_deadlines(burst_count: u8) -> Vec<Instant> {
+    let now = Instant::now();
+    announce_burst_delays(burst_count)
+        .into_iter()
+        .map(|d| now + d)
+        .collect()
+}
+
+/// Burst delays as durations (testable without Instant::now).
+#[must_use]
+pub fn announce_burst_delays(burst_count: u8) -> Vec<Duration> {
+    (0..burst_count)
+        .map(|i| Duration::from_secs(1u64 << i.min(31)))
+        .collect()
+}
+
+fn txt_sort_key(txt: &Option<HashMap<String, String>>) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = txt
+        .iter()
+        .flatten()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    pairs.sort();
+    pairs
+}
+
+fn sort_dynamic_ads(dynamic: &mut [DynAd]) {
+    dynamic.sort_by(|a, b| {
+        (
+            a.entry.name.as_str(),
+            a.entry.type_.as_str(),
+            a.entry.port,
+            a.entry.host.as_deref().unwrap_or(""),
+            txt_sort_key(&a.entry.txt),
+        )
+        .cmp(&(
+            b.entry.name.as_str(),
+            b.entry.type_.as_str(),
+            b.entry.port,
+            b.entry.host.as_deref().unwrap_or(""),
+            txt_sort_key(&b.entry.txt),
+        ))
+    });
+}
+
+/// Plan of register/refresh/drop actions. Refresh never includes unregister.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconcileAction {
+    Add(String),
+    Refresh(String),
+    Drop(String),
+}
+
+/// Compute reconcile actions. Refresh is register-only (no goodbye).
+#[must_use]
+pub fn plan_reconcile(
+    desired: &HashMap<String, ServiceEntry>,
+    registered: &HashMap<String, ServiceEntry>,
+    content_or_addr_changed: bool,
+) -> Vec<ReconcileAction> {
+    let mut actions = Vec::new();
+    for (key, entry) in desired {
+        if !registered.contains_key(key) {
+            actions.push(ReconcileAction::Add(key.clone()));
+            continue;
+        }
+        if registered.get(key) != Some(entry) || content_or_addr_changed {
+            actions.push(ReconcileAction::Refresh(key.clone()));
+        }
+    }
+    for key in registered.keys() {
+        if !desired.contains_key(key) {
+            actions.push(ReconcileAction::Drop(key.clone()));
+        }
+    }
+    actions.sort_by(|a, b| {
+        fn rank(x: &ReconcileAction) -> u8 {
+            match x {
+                ReconcileAction::Add(_) => 0,
+                ReconcileAction::Refresh(_) => 1,
+                ReconcileAction::Drop(_) => 2,
+            }
+        }
+        fn key(x: &ReconcileAction) -> &str {
+            match x {
+                ReconcileAction::Add(k) | ReconcileAction::Refresh(k) | ReconcileAction::Drop(k) => {
+                    k
+                }
+            }
+        }
+        rank(a).cmp(&rank(b)).then_with(|| key(a).cmp(key(b)))
+    });
+    actions
 }
 
 /// Log usable interfaces and their addresses when the advertisement set changes.
@@ -693,9 +906,9 @@ fn apply_wake(
             if *recreate_daemon {
                 return;
             }
-            // Same IPs after a link flap / resume still need IGMP leave+join
-            // and an mDNS announce; AddressSet equality would skip both.
-            membership.request_rejoin();
+            // Same IPs after a link flap still need a re-announce. Do NOT
+            // leave+join IGMP here: that drops multicast on snooping switches.
+            // Membership is refreshed when AnswerSet addresses actually change.
             *force_reannounce = true;
         }
         WakeReason::Suspend => {
@@ -786,7 +999,7 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
-    fn iface_change_forces_rejoin_not_rebind() {
+    fn iface_change_forces_reannounce_not_rejoin() {
         let membership = MembershipRefresh::new();
         let mut force = false;
         let mut recreate = false;
@@ -798,7 +1011,7 @@ mod tests {
         );
         assert!(force);
         assert!(!recreate);
-        assert_eq!(membership.epoch(), 1);
+        assert_eq!(membership.epoch(), 0);
         assert!(!membership.take_rebind());
     }
 

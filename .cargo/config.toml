@@ -1,0 +1,12 @@
+# Cross-link musl arm64 from x86_64 without a distro-specific musl-gcc package.
+# Uses Rust's self-contained crt + rust-lld (rustup target add aarch64-unknown-linux-musl).
+#
+# CI (rust-musl-ci) overrides via CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc.
+# Arch AUR alternative: aarch64-linux-musl-cross → linker = "aarch64-linux-musl-gcc".
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = [
+    "-C", "link-self-contained=yes",
+    "-C", "target-feature=+crt-static",
+]

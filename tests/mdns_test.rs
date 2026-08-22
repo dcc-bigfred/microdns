@@ -1,6 +1,6 @@
 use microdns::mdns::{
-    dcc_service_entry, iface_link_ready, is_allowed_iface, normalize_hostname,
-    normalize_service_type, should_skip_iface,
+    dcc_service_entry, iface_link_ready, iface_name_relevant, is_allowed_iface, normalize_hostname,
+    normalize_service_type, preferred_ipv4_ifaces, preferred_ipv6_addrs, should_skip_iface,
 };
 
 #[test]
@@ -131,4 +131,29 @@ fn dcc_entry_blank_host_is_none() {
         Some("  "),
     );
     assert_eq!(e.host, None);
+}
+
+#[test]
+fn iface_name_relevant_skips_lo_docker_and_configured() {
+    assert!(!iface_name_relevant("lo", &[], &[]));
+    assert!(!iface_name_relevant("docker0", &[], &[]));
+    assert!(!iface_name_relevant("wlan0", &[], &["wlan".into()]));
+    assert!(iface_name_relevant("eth0", &[], &["wlan".into()]));
+    assert!(iface_name_relevant("wlan0", &[], &[]));
+}
+
+#[test]
+fn preferred_addrs_are_sorted_and_stable() {
+    let a = preferred_ipv4_ifaces(&[], &[]);
+    let b = preferred_ipv4_ifaces(&[], &[]);
+    assert_eq!(a, b, "IPv4 iface list must be deterministic");
+    let v6a = preferred_ipv6_addrs(&[], &[]);
+    let v6b = preferred_ipv6_addrs(&[], &[]);
+    assert_eq!(v6a, v6b, "IPv6 addr list must be deterministic");
+    for window in a.windows(2) {
+        assert!(
+            (&window[0].iface, &window[0].addr) <= (&window[1].iface, &window[1].addr),
+            "IPv4 list not sorted: {a:?}"
+        );
+    }
 }
