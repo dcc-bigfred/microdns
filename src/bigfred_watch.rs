@@ -8,7 +8,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
-use dcc_daemon::ipc::{read_frame_bytes, write_frame_with_limit};
+use bigfred_shared_daemon::ipc::{read_frame_bytes, write_frame_with_limit};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};

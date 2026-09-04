@@ -38,9 +38,9 @@ fmt:
 clippy:
 	$(CARGO) clippy --all-targets -- -D warnings
 
-# Refresh git crates (dcc-daemon) and rewrite Cargo.lock. Commit the lockfile afterwards.
+# Refresh git crates (bigfred-shared-daemon) and rewrite Cargo.lock. Commit the lockfile afterwards.
 deps-update:
-	$(CARGO) update -p dcc-daemon
+	$(CARGO) update -p bigfred-shared-daemon
 
 clean:
 	$(CARGO) clean

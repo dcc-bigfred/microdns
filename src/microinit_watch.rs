@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use dcc_daemon::ipc::{read_frame_bytes, write_frame_with_limit};
+use bigfred_shared_daemon::ipc::{read_frame_bytes, write_frame_with_limit};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{self, Config, ServiceEntry};

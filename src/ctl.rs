@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use dcc_daemon::ipc::{
+use bigfred_shared_daemon::ipc::{
     read_frame_bytes, write_frame_with_limit, AcceptPolicy, Auth, BindError, BindOptions, Command,
     Connection, ErrorHandler, IpcError, RejectReason, Router, SessionMode,
 };
@@ -254,7 +254,7 @@ pub fn serve_with_runtime(
     runtime: Option<CtlRuntime>,
 ) -> Result<()> {
     let state = Arc::new(CtlState { snapshot, runtime });
-    dcc_daemon::ipc::serve_background(
+    bigfred_shared_daemon::ipc::serve_background(
         BindOptions {
             path: path.to_path_buf(),
             mode: 0o600,

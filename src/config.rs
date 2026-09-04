@@ -448,8 +448,8 @@ pub(crate) fn protocol_from_type(type_: &str) -> Option<&'static str> {
 
 /// Load config from `path`, creating a default file if missing.
 pub fn load_or_create(path: &Path) -> Result<Config> {
-    use dcc_daemon::config::Load;
-    let cfg = dcc_daemon::config::JsonFile::<Config>::new(path)
+    use bigfred_shared_daemon::config::Load;
+    let cfg = bigfred_shared_daemon::config::JsonFile::<Config>::new(path)
         .create_default()
         .load()
         .map_err(map_config)?;
@@ -457,13 +457,13 @@ pub fn load_or_create(path: &Path) -> Result<Config> {
     Ok(cfg)
 }
 
-fn map_config(e: dcc_daemon::config::ConfigError) -> Error {
+fn map_config(e: bigfred_shared_daemon::config::ConfigError) -> Error {
     match e {
-        dcc_daemon::config::ConfigError::Io { path, source } => {
+        bigfred_shared_daemon::config::ConfigError::Io { path, source } => {
             Error::io_at(PathBuf::from(path), source)
         }
-        dcc_daemon::config::ConfigError::Json(j) => Error::Json(j),
-        dcc_daemon::config::ConfigError::Other(s) => Error::Other(s),
+        bigfred_shared_daemon::config::ConfigError::Json(j) => Error::Json(j),
+        bigfred_shared_daemon::config::ConfigError::Other(s) => Error::Other(s),
     }
 }
 
