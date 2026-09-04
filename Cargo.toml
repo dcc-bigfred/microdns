@@ -19,10 +19,8 @@ path = "src/main.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
-# Git HTTPS. Pin the rust-commons commit that adds dcc-daemon
-# (https://github.com/dcc-bigfred/rust-commons/pull/1). After that lands on
-# main, switch to `branch = "main"` and run `make deps-update`.
-dcc-daemon = { git = "https://github.com/dcc-bigfred/rust-commons.git", rev = "bdc4155f124f82ce59c9a8801b4952be8e06f4a2" }
+# Git HTTPS from rust-commons (`main`; bump with `make deps-update`).
+dcc-daemon = { git = "https://github.com/dcc-bigfred/rust-commons.git", branch = "main" }
 mdns-sd = "0.20"
 nix = { version = "0.29", features = ["signal", "fs", "socket"] }
 thiserror = "2"

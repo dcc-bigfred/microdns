@@ -140,7 +140,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 [[package]]
 name = "dcc-daemon"
 version = "0.1.0"
-source = "git+https://github.com/dcc-bigfred/rust-commons.git?rev=bdc4155f124f82ce59c9a8801b4952be8e06f4a2#bdc4155f124f82ce59c9a8801b4952be8e06f4a2"
+source = "git+https://github.com/dcc-bigfred/rust-commons.git?branch=main#f740cf1b95037ab662697a713cbde8c2c05c3d9e"
 dependencies = [
  "log",
  "nix",
