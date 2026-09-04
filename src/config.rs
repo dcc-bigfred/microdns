@@ -448,20 +448,23 @@ pub(crate) fn protocol_from_type(type_: &str) -> Option<&'static str> {
 
 /// Load config from `path`, creating a default file if missing.
 pub fn load_or_create(path: &Path) -> Result<Config> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| Error::io_at(parent, e))?;
-    }
-
-    if !path.exists() {
-        let cfg = Config::default();
-        save(path, &cfg)?;
-        return Ok(cfg);
-    }
-
-    let data = fs::read_to_string(path).map_err(|e| Error::io_at(path, e))?;
-    let cfg: Config = serde_json::from_str(&data)?;
+    use dcc_daemon::config::Load;
+    let cfg = dcc_daemon::config::JsonFile::<Config>::new(path)
+        .create_default()
+        .load()
+        .map_err(map_config)?;
     cfg.validate()?;
     Ok(cfg)
+}
+
+fn map_config(e: dcc_daemon::config::ConfigError) -> Error {
+    match e {
+        dcc_daemon::config::ConfigError::Io { path, source } => {
+            Error::io_at(PathBuf::from(path), source)
+        }
+        dcc_daemon::config::ConfigError::Json(j) => Error::Json(j),
+        dcc_daemon::config::ConfigError::Other(s) => Error::Other(s),
+    }
 }
 
 /// Persist config as pretty JSON.
