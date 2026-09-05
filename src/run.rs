@@ -624,7 +624,7 @@ fn reload_loop(
 ) {
     while !stop.load(Ordering::SeqCst) && !signals::shutdown_requested() {
         match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(ReloadSignal) => match config::load_or_create(&shared.config_path) {
+            Ok(_) => match config::load_or_create(&shared.config_path) {
                 Ok(cfg) => {
                     // load_or_create already validates; keep last-known-good on failure.
                     if let Ok(mut w) = shared.config.write() {

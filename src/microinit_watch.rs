@@ -5,7 +5,6 @@
 //! advertised set. Reconnects with backoff; the caller keeps last-good ads.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +13,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
+use bigfred_shared_daemon::ipc::{read_frame_bytes, write_frame_with_limit};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{self, Config, ServiceEntry};
@@ -330,30 +330,9 @@ fn txt_from_labels(labels: &BTreeMap<String, String>) -> Option<HashMap<String, 
 }
 
 fn write_frame(stream: &mut UnixStream, msg: &impl Serialize) -> Result<()> {
-    let payload = serde_json::to_vec(msg)?;
-    if payload.len() > MAX_FRAME {
-        return Err(Error::Ipc(format!(
-            "frame length {} exceeds max {MAX_FRAME}",
-            payload.len()
-        )));
-    }
-    let len = u32::try_from(payload.len())
-        .map_err(|_| Error::Ipc("frame too large for u32 length prefix".into()))?
-        .to_le_bytes();
-    stream.write_all(&len)?;
-    stream.write_all(&payload)?;
-    stream.flush()?;
-    Ok(())
+    write_frame_with_limit(stream, msg, MAX_FRAME).map_err(|e| Error::Ipc(e.to_string()))
 }
 
 fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > MAX_FRAME {
-        return Err(Error::Ipc(format!("frame length {len} too large")));
-    }
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf)?;
-    Ok(buf)
+    read_frame_bytes(stream, MAX_FRAME).map_err(|e| Error::Ipc(e.to_string()))
 }

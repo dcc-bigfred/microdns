@@ -5,15 +5,18 @@
 //! (static `services[]` plus dynamic dcc-bus / microinit DNS-SD; not Z21 LAN beacons).
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::Write;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use std::thread;
 use std::time::Duration;
 
+use bigfred_shared_daemon::ipc::{
+    read_frame_bytes, write_frame_with_limit, AcceptPolicy, Auth, BindError, BindOptions, Command,
+    Connection, ErrorHandler, IpcError, RejectReason, Router, SessionMode,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::config::ServiceEntry;
 use crate::datadir;
@@ -93,12 +96,6 @@ pub struct ServicesListBody {
     pub services: Vec<ListedService>,
 }
 
-#[derive(Debug, Deserialize)]
-struct Request {
-    #[serde(rename = "type")]
-    type_: String,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 struct ErrorBody {
     error: String,
@@ -135,32 +132,11 @@ pub fn listed_services(ads: &DesiredAds) -> Vec<ListedService> {
 }
 
 pub fn write_frame_to(writer: &mut impl Write, msg: &impl Serialize) -> Result<()> {
-    let payload = serde_json::to_vec(msg)?;
-    if payload.len() > MAX_FRAME {
-        return Err(Error::Ipc(format!(
-            "frame length {} exceeds max {MAX_FRAME}",
-            payload.len()
-        )));
-    }
-    let len = u32::try_from(payload.len())
-        .map_err(|_| Error::Ipc("frame too large for u32 length prefix".into()))?
-        .to_le_bytes();
-    writer.write_all(&len)?;
-    writer.write_all(&payload)?;
-    writer.flush()?;
-    Ok(())
+    write_frame_with_limit(writer, msg, MAX_FRAME).map_err(|e| Error::Ipc(e.to_string()))
 }
 
-pub fn read_frame_from(reader: &mut impl Read) -> Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > MAX_FRAME {
-        return Err(Error::Ipc(format!("frame length {len} too large")));
-    }
-    let mut buf = vec![0u8; len];
-    reader.read_exact(&mut buf)?;
-    Ok(buf)
+pub fn read_frame_from(reader: &mut impl std::io::Read) -> Result<Vec<u8>> {
+    read_frame_bytes(reader, MAX_FRAME).map_err(|e| Error::Ipc(e.to_string()))
 }
 
 pub fn write_frame(stream: &mut UnixStream, msg: &impl Serialize) -> Result<()> {
@@ -171,54 +147,98 @@ pub fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>> {
     read_frame_from(stream)
 }
 
-/// Bind the control socket without stealing a live daemon's inode.
-///
-/// 1. `connect` — if a peer answers, refuse (`already running`); do not unlink.
-/// 2. `NotFound` / `ConnectionRefused` — leftover inode (or nothing) → unlink, then bind.
-/// 3. Any other connect error is returned as-is (do not unlink a mystery path).
-fn bind_singleton(socket_path: &Path) -> Result<UnixListener> {
-    match UnixStream::connect(socket_path) {
-        Ok(stream) => {
-            let pid = peer_pid(&stream);
-            let where_ = if pid != 0 {
-                format!("{} (pid {pid})", socket_path.display())
-            } else {
-                socket_path.display().to_string()
-            };
-            return Err(Error::Ipc(format!("microdns already running at {where_}")));
+fn map_bind(e: BindError) -> Error {
+    match e {
+        BindError::AlreadyRunning {
+            process_name,
+            location,
+            ..
+        } => Error::Ipc(format!("{process_name} already running at {location}")),
+        BindError::Io { path, source } => Error::io_at(path, source),
+    }
+}
+
+struct CtlState {
+    snapshot: Arc<RwLock<DesiredAds>>,
+    runtime: Option<CtlRuntime>,
+}
+
+struct ServicesListCmd;
+struct DoctorCmd;
+
+impl Command<CtlState> for ServicesListCmd {
+    fn name(&self) -> &'static str {
+        "services_list"
+    }
+    fn execute(
+        &self,
+        state: &CtlState,
+        _body: Value,
+        conn: &mut Connection,
+    ) -> std::result::Result<(), IpcError> {
+        let ads = match state.snapshot.read() {
+            Ok(g) => g.clone(),
+            Err(_) => {
+                let _ = conn.reply(&ErrorBody {
+                    error: "internal_error".into(),
+                });
+                return Ok(());
+            }
+        };
+        conn.reply(&ServicesListBody {
+            services: listed_services(&ads),
+        })
+        .map_err(IpcError::from)
+    }
+}
+
+impl Command<CtlState> for DoctorCmd {
+    fn name(&self) -> &'static str {
+        "doctor"
+    }
+    fn execute(
+        &self,
+        state: &CtlState,
+        _body: Value,
+        conn: &mut Connection,
+    ) -> std::result::Result<(), IpcError> {
+        match build_daemon_doctor(&state.snapshot, state.runtime.as_ref()) {
+            Ok(body) => conn.reply(&body).map_err(IpcError::from),
+            Err(e) => {
+                let _ = conn.reply(&ErrorBody {
+                    error: e.to_string(),
+                });
+                Ok(())
+            }
         }
-        Err(e) if is_stale_socket_connect_error(&e) => {}
-        Err(e) => return Err(Error::io_at(socket_path, e)),
     }
-    match std::fs::remove_file(socket_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(Error::io_at(socket_path, e)),
+}
+
+struct CtlHooks;
+
+impl ErrorHandler<CtlState> for CtlHooks {
+    fn unknown(&self, _state: &CtlState, _type_name: &str, _body: &Value, conn: &mut Connection) {
+        let _ = conn.reply(&ErrorBody {
+            error: "invalid_request".into(),
+        });
     }
-    UnixListener::bind(socket_path).map_err(|e| Error::io_at(socket_path, e))
+    fn error(&self, _state: &CtlState, _err: &IpcError, conn: &mut Connection) {
+        let _ = conn.reply(&ErrorBody {
+            error: "invalid_request".into(),
+        });
+    }
+    fn reject(&self, _state: &CtlState, _reason: RejectReason, _conn: &mut Connection) {}
 }
 
-fn is_stale_socket_connect_error(err: &std::io::Error) -> bool {
-    matches!(
-        err.kind(),
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-    )
-}
-
-fn peer_pid(stream: &UnixStream) -> u32 {
-    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-    getsockopt(stream, PeerCredentials)
-        .map(|c| c.pid() as u32)
-        .unwrap_or(0)
-}
-
-fn apply_socket_perms(socket_path: &Path) -> Result<()> {
-    let mut perms = std::fs::metadata(socket_path)
-        .map_err(|e| Error::io_at(socket_path, e))?
-        .permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(socket_path, perms).map_err(|e| Error::io_at(socket_path, e))?;
-    Ok(())
+fn ctl_router() -> std::result::Result<Router<CtlState>, Error> {
+    let mut router = Router::new();
+    router
+        .add(ServicesListCmd)
+        .map_err(|e| Error::Other(e.to_string()))?;
+    router
+        .add(DoctorCmd)
+        .map_err(|e| Error::Other(e.to_string()))?;
+    Ok(router)
 }
 
 /// Bind `$DATA_DIR/run/microdns.sock` (or `path`) and serve `services_list` in a
@@ -233,102 +253,27 @@ pub fn serve_with_runtime(
     snapshot: Arc<RwLock<DesiredAds>>,
     runtime: Option<CtlRuntime>,
 ) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| Error::io_at(parent, e))?;
-        }
-    }
-    let listener = bind_singleton(path)?;
-    apply_socket_perms(path)?;
+    let state = Arc::new(CtlState { snapshot, runtime });
+    bigfred_shared_daemon::ipc::serve_background(
+        BindOptions {
+            path: path.to_path_buf(),
+            mode: 0o600,
+            chown: None,
+            process_name: "microdns",
+        },
+        AcceptPolicy {
+            auth: Auth::None,
+            session: SessionMode::OneShot,
+            max_clients: None,
+            max_frame: MAX_FRAME,
+        },
+        ctl_router()?,
+        CtlHooks,
+        state,
+    )
+    .map_err(map_bind)?;
     log::info!("ctl listening on {}", path.display());
-
-    let path = path.to_path_buf();
-    thread::Builder::new()
-        .name("ctl".into())
-        .spawn(move || {
-            for conn in listener.incoming() {
-                match conn {
-                    Ok(stream) => {
-                        let snap = Arc::clone(&snapshot);
-                        let rt = runtime.clone();
-                        thread::spawn(move || handle_conn(stream, snap, rt));
-                    }
-                    Err(_) => {
-                        if !path.exists() {
-                            break;
-                        }
-                    }
-                }
-            }
-        })
-        .map_err(|e| Error::Ipc(format!("ctl thread: {e}")))?;
     Ok(())
-}
-
-fn handle_conn(
-    mut stream: UnixStream,
-    snapshot: Arc<RwLock<DesiredAds>>,
-    runtime: Option<CtlRuntime>,
-) {
-    let raw = match read_frame(&mut stream) {
-        Ok(b) => b,
-        Err(_) => return,
-    };
-    let req: Request = match serde_json::from_slice(&raw) {
-        Ok(r) => r,
-        Err(_) => {
-            let _ = write_frame(
-                &mut stream,
-                &ErrorBody {
-                    error: "invalid_request".into(),
-                },
-            );
-            return;
-        }
-    };
-    match req.type_.as_str() {
-        "services_list" => {
-            let ads = match snapshot.read() {
-                Ok(g) => g.clone(),
-                Err(_) => {
-                    let _ = write_frame(
-                        &mut stream,
-                        &ErrorBody {
-                            error: "internal_error".into(),
-                        },
-                    );
-                    return;
-                }
-            };
-            let body = ServicesListBody {
-                services: listed_services(&ads),
-            };
-            let _ = write_frame(&mut stream, &body);
-        }
-        "doctor" => {
-            let body = match build_daemon_doctor(&snapshot, runtime.as_ref()) {
-                Ok(b) => b,
-                Err(e) => {
-                    let _ = write_frame(
-                        &mut stream,
-                        &ErrorBody {
-                            error: e.to_string(),
-                        },
-                    );
-                    return;
-                }
-            };
-            let _ = write_frame(&mut stream, &body);
-        }
-        _ => {
-            let _ = write_frame(
-                &mut stream,
-                &ErrorBody {
-                    error: "invalid_request".into(),
-                },
-            );
-        }
-    }
 }
 
 fn build_daemon_doctor(

@@ -6,7 +6,7 @@ RUSTUP_TOOLCHAIN ?= stable
 export RUSTUP_TOOLCHAIN
 
 .PHONY: all build release release-musl check test test-release-assertions \
-	clean fmt clippy hub-upload deploy
+	clean fmt clippy hub-upload deploy deps-update
 
 all: build
 
@@ -37,6 +37,10 @@ fmt:
 
 clippy:
 	$(CARGO) clippy --all-targets -- -D warnings
+
+# Refresh git crates (bigfred-shared-daemon) and rewrite Cargo.lock. Commit the lockfile afterwards.
+deps-update:
+	$(CARGO) update -p bigfred-shared-daemon
 
 clean:
 	$(CARGO) clean
